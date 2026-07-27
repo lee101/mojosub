@@ -14,6 +14,14 @@ from dataclasses import dataclass, field
 
 from .types import ARRAY_F64, ARRAY_I64, BOOL, FLOAT, INT, NONE, Array, Scalar, Ty, promote
 
+VEC_WIDTH = 4
+VEC_I = "__vi"
+MAP_VECTOR_MIN_OPS = 3
+
+
+def _op_count(node) -> int:
+    return sum(1 for n in ast.walk(node) if isinstance(n, (ast.BinOp, ast.UnaryOp)))
+
 MATH_1 = {
     "sqrt": FLOAT, "exp": FLOAT, "log": FLOAT, "log2": FLOAT, "log10": FLOAT,
     "sin": FLOAT, "cos": FLOAT, "tan": FLOAT, "tanh": FLOAT, "atan": FLOAT,
@@ -79,9 +87,13 @@ def _coerce(code: str, have: Ty, want: Ty) -> str:
 class _Fn:
     """Emits one function body."""
 
-    def __init__(self, unit_sigs: dict[str, Signature], sig: Signature):
+    def __init__(self, unit_sigs: dict[str, Signature], sig: Signature,
+                 vectorize: bool = True):
         self.sigs = unit_sigs
         self.sig = sig
+        self.vectorize = vectorize
+        self._vec_index: str | None = None
+        self._vec_acc: str | None = None
         self.env: dict[str, Ty] = {}
         self.lines: list[str] = []
         for name, ty in sig.params:
@@ -336,11 +348,115 @@ class _Fn:
         self.block(n.body, depth + 1)
         return True
 
+    # -- vectorization --------------------------------------------------
+    def _vec_expr(self, node) -> str:
+        """Render `node` as a float64 SIMD expression, or refuse.
+
+        The only shapes allowed are the ones that vectorize cleanly: buffer
+        loads at exactly the loop index, float scalars broadcast, and the four
+        arithmetic operators. Anything else — a branch, a call, an index
+        expression — bails out and the loop is emitted scalar.
+        """
+        if isinstance(node, ast.Subscript):
+            base, bt = self.expr(node.value)
+            if not isinstance(bt, Array) or bt.elem is not FLOAT:
+                raise Unsupported("vector load of non-float buffer")
+            if not (isinstance(node.slice, ast.Name) and node.slice.id == self._vec_index):
+                raise Unsupported("vector load must be indexed by the loop variable")
+            return f"{base}.load[width={VEC_WIDTH}]({VEC_I})"
+        if isinstance(node, ast.Constant):
+            code, ty = self.e_Constant(node)
+            return f"SIMD[DType.float64, {VEC_WIDTH}]({_coerce(code, ty, FLOAT)})"
+        if isinstance(node, ast.Name):
+            if node.id == self._vec_index or node.id == self._vec_acc:
+                raise Unsupported("loop-carried scalar in vector body")
+            code, ty = self.e_Name(node)
+            if ty not in (FLOAT, INT):
+                raise Unsupported("vector operand must be numeric")
+            return f"SIMD[DType.float64, {VEC_WIDTH}]({_coerce(code, ty, FLOAT)})"
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            inner = self._vec_expr(node.operand)
+            return f"(-{inner})" if isinstance(node.op, ast.USub) else inner
+        if isinstance(node, ast.BinOp):
+            sym = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/"}.get(
+                type(node.op)
+            )
+            if sym is None:
+                raise Unsupported("operator does not vectorize")
+            return f"({self._vec_expr(node.left)} {sym} {self._vec_expr(node.right)})"
+        raise Unsupported("expression does not vectorize")
+
+    def _try_vectorize(self, n, depth) -> bool:
+        """Emit a SIMD version of a one-statement map or reduce loop.
+
+        Worth about 1.4x on a float reduction over a large buffer, which is the
+        single most common shape in the code these functions come from.
+        """
+        if len(n.iter.args) != 1 or len(n.body) != 1:
+            return False
+        stmt = n.body[0]
+        limit_code, limit_ty = self.expr(n.iter.args[0])
+        limit = _coerce(limit_code, limit_ty, INT)
+        self._vec_index = n.target.id
+        self._vec_acc = None
+        saved = list(self.lines)
+
+        try:
+            if isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add) \
+                    and isinstance(stmt.target, ast.Name):
+                acc = stmt.target.id
+                if self.env.get(acc) is not FLOAT:
+                    return False
+                self._vec_acc = acc
+                body = self._vec_expr(stmt.value)
+                partial = f"__v_{acc}"
+                self.out(depth, f"var {partial} = SIMD[DType.float64, {VEC_WIDTH}](0.0)")
+                self.out(depth, f"var {VEC_I} = 0")
+                self.out(depth, f"while {VEC_I} + {VEC_WIDTH} <= {limit}:")
+                self.out(depth + 1, f"{partial} += {body}")
+                self.out(depth + 1, f"{VEC_I} += {VEC_WIDTH}")
+                self.out(depth, f"{acc} += {partial}.reduce_add()")
+            elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 \
+                    and isinstance(stmt.targets[0], ast.Subscript):
+                target = stmt.targets[0]
+                base, bt = self.expr(target.value)
+                if not isinstance(bt, Array) or bt.elem is not FLOAT:
+                    return False
+                if not (isinstance(target.slice, ast.Name)
+                        and target.slice.id == self._vec_index):
+                    return False
+                if _op_count(stmt.value) < MAP_VECTOR_MIN_OPS:
+                    # A store loop this simple is memory-bound, and measurably
+                    # slower vectorized (0.68ms -> 1.24ms on 1e6 elements) than
+                    # what LLVM already does with the scalar form. Reductions
+                    # have no such crossover, so only stores are gated.
+                    return False
+                body = self._vec_expr(stmt.value)
+                self.out(depth, f"var {VEC_I} = 0")
+                self.out(depth, f"while {VEC_I} + {VEC_WIDTH} <= {limit}:")
+                self.out(depth + 1, f"{base}.store({VEC_I}, {body})")
+                self.out(depth + 1, f"{VEC_I} += {VEC_WIDTH}")
+            else:
+                return False
+        except Unsupported:
+            self.lines = saved
+            return False
+        finally:
+            self._vec_acc = None
+
+        # the tail, scalar, for the elements the vector width did not cover
+        self.env[self._vec_index] = INT
+        self.out(depth, f"for {self._vec_index} in range({VEC_I}, {limit}):")
+        self.block(n.body, depth + 1)
+        return True
+
     def s_For(self, n, depth) -> bool:
         if n.orelse or not isinstance(n.target, ast.Name):
             raise Unsupported("for form")
         if not (isinstance(n.iter, ast.Call) and self._callee_safe(n.iter.func) == "range"):
             raise Unsupported("for over non-range")
+        if self.vectorize and self._try_vectorize(n, depth):
+            return True
         args = []
         for a in n.iter.args:
             c, t = self.expr(a)
@@ -375,7 +491,8 @@ PRELUDE = (
 )
 
 
-def transpile(tree: ast.Module, sigs: dict[str, Signature], entry: str) -> Unit:
+def transpile(tree: ast.Module, sigs: dict[str, Signature], entry: str,
+              vectorize: bool = True) -> Unit:
     """Render `tree`'s functions as Mojo, exporting `entry` under a C symbol."""
     bodies = []
     fns = {f.name: f for f in tree.body if isinstance(f, ast.FunctionDef)}
@@ -385,7 +502,7 @@ def transpile(tree: ast.Module, sigs: dict[str, Signature], entry: str) -> Unit:
             raise Unsupported(f"no such function {name}")
         if fn.args.vararg or fn.args.kwarg or fn.args.kwonlyargs or fn.args.defaults:
             raise Unsupported("only positional parameters are supported")
-        emitter = _Fn(sigs, sig)
+        emitter = _Fn(sigs, sig, vectorize=vectorize)
         emitter.block(fn.body, 1)
         bodies.append(emitter.render())
 

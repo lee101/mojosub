@@ -34,7 +34,7 @@ Measured on a Ryzen workstation, Mojo `1.0.0b3.dev2026072406`, CPython 3.13.
 | `dot(1e6)` on numpy input | 87.6 ms | 2.4 ms | **36x** |
 | `dot(1e6)` on a Python list | 95.1 ms | 302.9 ms | **0.3x** |
 | `logistic(1e4 x 100)` | 71.6 ms | 3.0 ms | **24x** |
-| `sma_crossover(1e6)` | 590.7 ms | 5.3 ms | **112x** |
+| `sma_crossover(1e6)` | 364.7 ms | 3.2 ms | **114x** |
 
 The one loss is the point of the table. A `list[float]` has to be copied into a
 contiguous buffer on every call, and for a million elements that copy costs more
@@ -68,6 +68,43 @@ implemented here:
    snippets compiled together cost 0.98 s each instead of 5 s each, and twenty
    cost 0.25 s each.
 
+### GPU
+
+`target="gpu"` compiles a per-element loop into a CUDA kernel instead. On an
+RTX 5090 over 1e6 float64 elements, varying the arithmetic per element:
+
+| flops/byte | GPU | CPU (SIMD) | speedup |
+| ---: | ---: | ---: | ---: |
+| 0.2 | 4.2 ms | 2.6 ms | 0.6x |
+| 1.9 | 3.6 ms | 8.9 ms | 2.5x |
+| 18.8 | 6.2 ms | 220 ms | 35x |
+| 187.5 | 9.1 ms | 2396 ms | **263x** |
+
+The crossover is around 2 flops per byte, and it is a crossover in arithmetic
+intensity, not in size: a single elementwise pass over host memory stayed
+transfer-bound at every size tested up to 50M elements. That is why the GPU is
+opt-in rather than automatic — a runtime trip count does not tell mojosub how
+much arithmetic is coming.
+
+```python
+from mojosub import compile_function, type_of
+from mojosub.types import NONE
+
+def simulate(a: list[float], b: list[float], steps: int, r: float):
+    for i in range(len(a)):          # one iteration per GPU thread
+        x = a[i]
+        for _ in range(steps):
+            x = r * x * (1.0 - x)
+        b[i] = x
+
+kernel, _ = compile_function(simulate, argtypes, NONE, target="gpu")
+kernel(a, b, 1000, 3.7)              # results come back in b
+```
+
+Needs the `max` package for the device runtime (it is in this repo's pixi
+environment). Reductions and anything that is not a single element loop are
+refused, not silently run on the CPU.
+
 ## Install
 
 ```bash
@@ -97,8 +134,31 @@ call = compile_source(source, "kernel", (n,))   # keep the callable
 calls = compile_batch([(src, "kernel", args), ...])  # one compile, many entries
 ```
 
+```python
+@jit(hot_calls=4, hot_seconds=0.05)   # compile only what proves it is hot
+@jit(verify=True)                     # check the first native result vs CPython
+@jit(vectorize=False)                 # turn off SIMD codegen
+```
+
 `JitFunction.stats` reports how many calls went each way, how long compilation
-took, and why a function fell back.
+took, how many variants failed verification, and why a function fell back.
+
+### Being sure it is right
+
+`verify=True` runs both tiers once per signature and compares before trusting
+the compiled variant; a mismatch retires it permanently and the caller keeps
+getting the CPython answer. That is what makes the 64-bit integer cliff below
+safe to live with rather than a lurking wrong number.
+
+### SIMD
+
+Reduction loops (`s += f(a[i], b[i], ...)`) are emitted as width-4 `SIMD`
+accumulations with a scalar tail, which is worth about 2x on a large float
+reduction. Store loops are only vectorized when the expression carries at
+least three arithmetic operations: below that they are memory-bound, and the
+explicit vector form measured *slower* than what LLVM already does with the
+scalar loop (0.68 ms vs 1.24 ms over 1e6 elements). The threshold is a
+measurement, not a guess.
 
 ## The subset
 

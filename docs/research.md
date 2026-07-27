@@ -96,6 +96,44 @@ signature, and the compiler runs behind it.
   overflow check on every operation or a bignum runtime, and both give back
   most of the speedup.
 
+## Measurement 5: SIMD, and where hand-vectorizing loses
+
+Emitting width-4 `SIMD` accumulations for reduction loops is worth about 2x
+(`dot` over 1e6 float64: 2.2 ms scalar, 1.35 ms vectorized). Doing the same for
+store loops is not always a win — LLVM already vectorizes the simple ones, and
+the explicit form was measurably worse:
+
+| loop | scalar | vectorized |
+| --- | ---: | ---: |
+| `b[i] = a[i] * k + 1.0` | 0.68 ms | 1.24 ms |
+| `b[i] = (a[i]*a[i]*k + a[i]/3 - a[i]*0.5) * (a[i]+k)` | 3.09 ms | 1.83 ms |
+
+So store loops are vectorized only above three arithmetic operations, which is
+roughly where the loop stops being memory-bound. Reductions have no such
+crossover — the sequential dependency is what LLVM will not break on its own.
+
+## Measurement 6: the GPU crossover is arithmetic intensity, not size
+
+Same per-element loop on an RTX 5090, 1e6 float64 elements, varying only how
+much arithmetic each element gets:
+
+| flops/byte | GPU | CPU (SIMD) | speedup |
+| ---: | ---: | ---: | ---: |
+| 0.2 | 4.2 ms | 2.6 ms | 0.6x |
+| 1.9 | 3.6 ms | 8.9 ms | 2.5x |
+| 18.8 | 6.2 ms | 220 ms | 35x |
+| 187.5 | 9.1 ms | 2396 ms | 263x |
+
+A single elementwise pass loses at *every* size tested — 100k, 1M, 10M, 50M —
+because the PCIe round trip costs more than the arithmetic saves. Scaling up
+the array does not help; only scaling up the work per element does. The
+crossover sits near 2 flops per byte.
+
+That kills the obvious feature (automatically move big arrays to the GPU) and
+justifies the one that is implemented: `target="gpu"` is explicit, refuses
+anything that is not a single element loop, and returns results through the
+caller's buffers.
+
 ## What is next
 
 - A persistent compile worker, so process start is paid once rather than per
@@ -103,6 +141,9 @@ signature, and the compiler runs behind it.
   holding a queue and building batched units on a timer.
 - Speculative batching in `@jit`: collect every function that misses the cache
   during the first second of a run and compile them as one unit.
-- SIMD and `parallelize` in generated code for reduction and map shapes, which
-  is where the remaining order of magnitude is.
+- Multi-threading the generated CPU code with `parallelize`, which is the
+  remaining order of magnitude on large buffers.
+- Keeping GPU buffers resident across calls, so a pipeline of kernels pays the
+  transfer once instead of per kernel — the measurement above says that is
+  where the rest of the GPU win lives.
 - 2-D buffers, which unlock most of the scikit-learn-shaped work.

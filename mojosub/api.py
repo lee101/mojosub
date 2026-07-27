@@ -17,6 +17,7 @@ from .transpile import (
     signature_from_annotations,
     transpile,
 )
+from .gpu import transpile_gpu
 from .types import ARRAY_F64, ARRAY_I64, BOOL, FLOAT, INT, NONE, Array, Ty
 
 __all__ = [
@@ -56,6 +57,15 @@ def type_of(value) -> Ty:
 _SCALAR_TYPES = {bool: BOOL, int: INT, float: FLOAT}
 
 
+def _equalish(a, b, rtol: float = 1e-9) -> bool:
+    """Compare two results, tolerating float reassociation but nothing else."""
+    if isinstance(a, float) and isinstance(b, float):
+        if a != a and b != b:  # both NaN
+            return True
+        return abs(a - b) <= rtol * max(1.0, abs(a), abs(b))
+    return a == b
+
+
 @dataclass
 class Stats:
     python_calls: int = 0
@@ -63,6 +73,7 @@ class Stats:
     compiles: int = 0
     compile_seconds: float = 0.0
     cache_hits: int = 0
+    verify_failures: int = 0
     last_error: str | None = None
 
 
@@ -92,8 +103,15 @@ def compile_function(
     ret: Ty | None = None,
     opt: int = 3,
     tree: ast.Module | None = None,
+    vectorize: bool = True,
+    target: str = "cpu",
 ) -> tuple[_Callable, str]:
-    """Compile `fn` for one concrete signature. Returns (callable, mojo source)."""
+    """Compile `fn` for one concrete signature. Returns (callable, mojo source).
+
+    `target="gpu"` emits a CUDA kernel instead, for the per-element loop shape
+    only — see `mojosub.gpu` for the measurements that say when that is worth
+    the transfer.
+    """
     tree = tree if tree is not None else _module_of(fn)
     entry = fn.__name__
     fndef = next(
@@ -113,11 +131,43 @@ def compile_function(
             raise Unsupported("unknown return type")
         sig = Signature(entry, list(zip(names, argtypes)), chosen_ret)
 
+    if target == "gpu":
+        return _compile_gpu(tree, entry, sig, opt)
+
     sigs = _helpers(tree, entry, getattr(fn, "__globals__", {}))
     sigs[entry] = sig
-    unit = transpile(tree, sigs, entry)
+    unit = transpile(tree, sigs, entry, vectorize=vectorize)
     lib = cache.compile_unit(unit.source, opt=opt)
     return _Callable(lib, sig), unit.source
+
+
+class GpuCallable:
+    """A compiled GPU entry point. Results come back through the buffers."""
+
+    def __init__(self, inner: _Callable):
+        self._inner = inner
+        self.sig = inner.sig
+        self.lib_path = inner.lib_path
+
+    @property
+    def dispatch(self):
+        return self
+
+    def __call__(self, *args):
+        status = self._inner(*args)
+        if status != 0:
+            raise RuntimeError(
+                f"{self.sig.name}: GPU launch failed (is a device visible?)"
+            )
+        return None
+
+
+def _compile_gpu(tree, entry: str, sig: Signature, opt: int):
+    gpu_sig = Signature(entry, list(sig.params), NONE)
+    unit = transpile_gpu(tree, gpu_sig, entry)
+    lib = cache.compile_unit(unit.source, opt=opt)
+    status_sig = Signature(entry, list(sig.params), INT)
+    return GpuCallable(_Callable(lib, status_sig)), unit.source
 
 
 class JitFunction:
@@ -131,16 +181,24 @@ class JitFunction:
     unless `strict=True`.
     """
 
-    def __init__(self, fn, mode: str = "tiered", opt: int = 3, strict: bool = False):
+    def __init__(self, fn, mode: str = "tiered", opt: int = 3, strict: bool = False,
+                 hot_calls: int = 1, hot_seconds: float = 0.0,
+                 verify: bool = False, vectorize: bool = True):
         self.fn = fn
         self.mode = mode
         self.opt = opt
         self.strict = strict
+        self.hot_calls = max(1, int(hot_calls))
+        self.hot_seconds = float(hot_seconds)
+        self.verify = verify
+        self.vectorize = vectorize
         self.stats = Stats()
         self.mojo_source: str | None = None
         self._variants: dict[tuple, _Callable] = {}
         self._pending: set[tuple] = set()
         self._failed: set[tuple] = set()
+        self._unverified: set[tuple] = set()
+        self._profile: dict[tuple, list] = {}   # key -> [calls, seconds]
         self._lock = threading.Lock()
         self._tree: ast.Module | None = None
         functools_wraps(self, fn)
@@ -155,11 +213,14 @@ class JitFunction:
         started = time.perf_counter()
         try:
             call, src = compile_function(
-                self.fn, argtypes, ret, opt=self.opt, tree=self._tree_of()
+                self.fn, argtypes, ret, opt=self.opt, tree=self._tree_of(),
+                vectorize=self.vectorize,
             )
             self.mojo_source = src
             with self._lock:
                 self._variants[key] = call.dispatch
+                if self.verify:
+                    self._unverified.add(key)
                 self.stats.compiles += 1
                 self.stats.compile_seconds += time.perf_counter() - started
         except Exception as exc:  # noqa: BLE001 - fallback is the contract
@@ -202,16 +263,30 @@ class JitFunction:
 
         call = self._variants.get(key)
         if call is not None:
+            if key in self._unverified:
+                return self._verified_call(key, call, args)
             self.stats.mojo_calls += 1
             return call(*args)
         if key in self._failed:
             self.stats.python_calls += 1
             return self.fn(*args)
 
+        started = time.perf_counter()
         result = self.fn(*args)
+        elapsed = time.perf_counter() - started
         self.stats.python_calls += 1
+
         with self._lock:
             if key in self._pending or key in self._variants or key in self._failed:
+                return result
+            profile = self._profile.setdefault(key, [0, 0.0])
+            profile[0] += 1
+            profile[1] += elapsed
+            hot = profile[0] >= self.hot_calls or (
+                self.hot_seconds > 0.0 and profile[1] >= self.hot_seconds
+            )
+            if not hot:
+                # not hot enough to be worth several seconds of compiler
                 return result
             self._pending.add(key)
         try:
@@ -228,6 +303,32 @@ class JitFunction:
                 target=self._build, args=(key, argtypes, ret), daemon=True
             ).start()
         return result
+
+    def _verified_call(self, key, call, args):
+        """Run both tiers once and compare before trusting the compiled one.
+
+        Mojo's Int is 64-bit and wraps where CPython promotes, and a vectorized
+        reduction sums in a different order, so `verify=True` buys certainty for
+        the price of one extra Python call per signature. A mismatch retires the
+        variant permanently rather than raising: the answer the caller gets is
+        always the Python one.
+        """
+        expected = self.fn(*args)
+        actual = call(*args)
+        self.stats.python_calls += 1
+        with self._lock:
+            self._unverified.discard(key)
+        if _equalish(expected, actual):
+            self.stats.mojo_calls += 1
+            return actual
+        with self._lock:
+            self._variants.pop(key, None)
+            self._failed.add(key)
+            self.stats.verify_failures += 1
+            self.stats.last_error = (
+                f"verification failed: python={expected!r} mojo={actual!r}"
+            )
+        return expected
 
     def wait(self, timeout: float = 600.0) -> bool:
         """Block until every in-flight compile finishes. Returns True if idle."""
@@ -252,11 +353,20 @@ def functools_wraps(wrapper, fn) -> None:
             pass
 
 
-def jit(fn=None, *, mode: str = "tiered", opt: int = 3, strict: bool = False):
-    """Decorator: run `fn` in Mojo once it has been compiled for these types."""
+def jit(fn=None, *, mode: str = "tiered", opt: int = 3, strict: bool = False,
+        hot_calls: int = 1, hot_seconds: float = 0.0, verify: bool = False,
+        vectorize: bool = True):
+    """Decorator: run `fn` in Mojo once it has been compiled for these types.
+
+    `hot_calls` / `hot_seconds` hold compilation back until the function has
+    proved it is worth several seconds of compiler; `verify` checks the first
+    native result against CPython before trusting the variant.
+    """
+    kwargs = dict(mode=mode, opt=opt, strict=strict, hot_calls=hot_calls,
+                  hot_seconds=hot_seconds, verify=verify, vectorize=vectorize)
     if fn is None:
-        return lambda f: JitFunction(f, mode=mode, opt=opt, strict=strict)
-    return JitFunction(fn, mode=mode, opt=opt, strict=strict)
+        return lambda f: JitFunction(f, **kwargs)
+    return JitFunction(fn, **kwargs)
 
 
 
@@ -326,7 +436,8 @@ def compile_batch(jobs, opt: int = 3):
 _EXEC_MEMO: dict[tuple, object] = {}
 
 
-def compile_source(source: str, entry: str, args=(), opt: int = 3):
+def compile_source(source: str, entry: str, args=(), opt: int = 3,
+                   target: str = "cpu"):
     """Compile `entry` from a source string for these argument types.
 
     Repeated calls with the same source and argument shapes hit an in-process
@@ -334,7 +445,7 @@ def compile_source(source: str, entry: str, args=(), opt: int = 3):
     that runs the same snippet a thousand times pays for it once.
     """
     argtypes = [type_of(a) for a in args]
-    memo_key = (source, entry, opt, tuple(t.mojo for t in argtypes))
+    memo_key = (source, entry, opt, target, tuple(t.mojo for t in argtypes))
     hit = _EXEC_MEMO.get(memo_key)
     if hit is not None:
         return hit
@@ -353,12 +464,16 @@ def compile_source(source: str, entry: str, args=(), opt: int = 3):
         exec(compile(tree, "<mojosub>", "exec"), namespace)  # noqa: S102
         probe = namespace[entry](*args)
         ret = type_of(probe) if probe is not None else NONE
-    sigs = _helpers(tree, entry, {})
     names = [a.arg for a in fndef.args.args]
-    sigs[entry] = Signature(entry, list(zip(names, argtypes)), ret)
-    unit = transpile(tree, sigs, entry)
-    lib = cache.compile_unit(unit.source, opt=opt)
-    call = _Callable(lib, sigs[entry]).dispatch
+    sig = Signature(entry, list(zip(names, argtypes)), ret)
+    if target == "gpu":
+        call = _compile_gpu(tree, entry, sig, opt)[0].dispatch
+    else:
+        sigs = _helpers(tree, entry, {})
+        sigs[entry] = sig
+        unit = transpile(tree, sigs, entry)
+        lib = cache.compile_unit(unit.source, opt=opt)
+        call = _Callable(lib, sig).dispatch
     _EXEC_MEMO[memo_key] = call
     return call
 

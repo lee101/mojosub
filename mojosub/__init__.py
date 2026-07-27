@@ -14,6 +14,7 @@ and every later call dispatches into native code in under a microsecond.
 """
 
 from .api import (
+    GpuCallable,
     JitFunction,
     Stats,
     Unsupported,
@@ -38,6 +39,7 @@ __all__ = [
     "clear_cache",
     "mojo_version",
     "JitFunction",
+    "GpuCallable",
     "Stats",
     "Unsupported",
     "ToolchainError",
