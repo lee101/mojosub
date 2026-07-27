@@ -1,0 +1,23 @@
+[project]
+name = "mojosub"
+version = "0.1.0"
+description = "Compile a subset of Python to Mojo and call it at C speed"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Lee Penkman", email = "leepenkman@gmail.com" }]
+keywords = ["mojo", "jit", "transpiler", "performance", "codegen"]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "numpy"]
+
+[project.urls]
+Homepage = "https://github.com/lee101/mojosub"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mojosub*"]
