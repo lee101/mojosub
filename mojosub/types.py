@@ -63,3 +63,15 @@ def from_annotation(name: str) -> Ty:
         "list[float]": ARRAY_F64,
         "list[int]": ARRAY_I64,
     }[name]
+
+
+def by_mojo(name: str) -> Ty:
+    """The type whose `.mojo` spelling is `name`.
+
+    The inverse of `Ty.mojo`, used to rebuild a signature that a previous
+    process inferred and wrote to the cache.
+    """
+    for ty in (INT, FLOAT, BOOL, NONE, ARRAY_F64, ARRAY_I64):
+        if ty.mojo == name:
+            return ty
+    raise KeyError(name)

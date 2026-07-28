@@ -19,6 +19,7 @@ from .transpile import (
 )
 from .gpu import transpile_gpu
 from .types import ARRAY_F64, ARRAY_I64, BOOL, FLOAT, INT, NONE, Array, Ty
+from .types import by_mojo as types_by_mojo
 
 __all__ = [
     "jit",
@@ -29,6 +30,18 @@ __all__ = [
     "Stats",
     "Unsupported",
 ]
+
+
+# How much slower than CPython a compiled variant may be before it is retired.
+# Slightly over 1.0 because the two timings are single samples and the compiled
+# side pays a first-call page-in; a variant that is genuinely faster clears this
+# by an order of magnitude, so the tolerance costs nothing real.
+SLOWER_THAN_PYTHON = 1.1
+
+# A call this short is not worth judging: the two samples are dominated by
+# timer noise, and a variant retired on a 50-microsecond sample never comes
+# back - not even when the next call arrives with a million rows behind it.
+MIN_TIMED_SECONDS = 0.001
 
 
 def type_of(value) -> Ty:
@@ -71,15 +84,41 @@ class Stats:
     python_calls: int = 0
     mojo_calls: int = 0
     compiles: int = 0
+    warm_starts: int = 0
     compile_seconds: float = 0.0
     cache_hits: int = 0
     verify_failures: int = 0
+    retired_slower: int = 0
     last_error: str | None = None
 
 
-def _module_of(fn) -> ast.Module:
-    src = textwrap.dedent(inspect.getsource(fn))
-    tree = ast.parse(src)
+def _module_of(fn, source: str | None = None) -> ast.Module:
+    """The function's own source, as an AST.
+
+    `inspect.getsource` cannot see a function defined by `exec` of a string -
+    which is exactly how generated code arrives, so the most valuable functions
+    to compile were the ones this used to refuse. Callers that hold the source
+    can hand it over directly, tag the function with `__mojosub_source__`, or
+    put the module text under that name in the namespace they exec into.
+    """
+    src = source
+    if src is None:
+        src = getattr(fn, "__mojosub_source__", None)
+    if src is None:
+        src = getattr(fn, "__globals__", {}).get("__mojosub_source__")
+    if src is None:
+        src = inspect.getsource(fn)
+    tree = ast.parse(textwrap.dedent(src))
+    body = [
+        node for node in tree.body
+        if not isinstance(node, ast.FunctionDef) or node.name == fn.__name__
+    ]
+    # A whole-module source carries every other definition too; keep the
+    # helpers (which `_helpers` reads for their signatures) and drop rival
+    # functions of the same name from an earlier cell.
+    tree.body = body if any(
+        isinstance(n, ast.FunctionDef) and n.name == fn.__name__ for n in body
+    ) else tree.body
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             node.decorator_list = []
@@ -105,12 +144,18 @@ def compile_function(
     tree: ast.Module | None = None,
     vectorize: bool = True,
     target: str = "cpu",
+    only_if_cached: bool = False,
 ) -> tuple[_Callable, str]:
     """Compile `fn` for one concrete signature. Returns (callable, mojo source).
 
     `target="gpu"` emits a CUDA kernel instead, for the per-element loop shape
     only — see `mojosub.gpu` for the measurements that say when that is worth
     the transfer.
+
+    `only_if_cached=True` returns `(None, source)` rather than starting a build
+    when the library is not already on disk. Transpiling is milliseconds and
+    compiling is seconds, so that is the difference between a caller that can
+    afford to ask on the hot path and one that cannot.
     """
     tree = tree if tree is not None else _module_of(fn)
     entry = fn.__name__
@@ -137,7 +182,12 @@ def compile_function(
     sigs = _helpers(tree, entry, getattr(fn, "__globals__", {}))
     sigs[entry] = sig
     unit = transpile(tree, sigs, entry, vectorize=vectorize)
-    lib = cache.compile_unit(unit.source, opt=opt)
+    if only_if_cached:
+        lib = cache.lookup(unit.source, opt=opt)
+        if lib is None:
+            return None, unit.source
+    else:
+        lib = cache.compile_unit(unit.source, opt=opt)
     return _Callable(lib, sig), unit.source
 
 
@@ -183,8 +233,10 @@ class JitFunction:
 
     def __init__(self, fn, mode: str = "tiered", opt: int = 3, strict: bool = False,
                  hot_calls: int = 1, hot_seconds: float = 0.0,
-                 verify: bool = False, vectorize: bool = True):
+                 verify: bool = False, vectorize: bool = True, warm: bool = True,
+                 source: str | None = None):
         self.fn = fn
+        self.source = source
         self.mode = mode
         self.opt = opt
         self.strict = strict
@@ -192,6 +244,7 @@ class JitFunction:
         self.hot_seconds = float(hot_seconds)
         self.verify = verify
         self.vectorize = vectorize
+        self.warm = warm
         self.stats = Stats()
         self.mojo_source: str | None = None
         self._variants: dict[tuple, _Callable] = {}
@@ -201,12 +254,20 @@ class JitFunction:
         self._profile: dict[tuple, list] = {}   # key -> [calls, seconds]
         self._lock = threading.Lock()
         self._tree: ast.Module | None = None
+        self._warm_tried: set[tuple] = set()
+        self._src: str | None = None
         functools_wraps(self, fn)
+
+    def _source(self) -> str:
+        """Normalised source text, the key the signature memo is filed under."""
+        if self._src is None:
+            self._src = ast.unparse(self._tree_of())
+        return self._src
 
     # -- compilation ----------------------------------------------------
     def _tree_of(self) -> ast.Module:
         if self._tree is None:
-            self._tree = _module_of(self.fn)
+            self._tree = _module_of(self.fn, self.source)
         return self._tree
 
     def _build(self, key: tuple, argtypes: list[Ty], ret: Ty) -> None:
@@ -217,6 +278,10 @@ class JitFunction:
                 vectorize=self.vectorize,
             )
             self.mojo_source = src
+            try:
+                cache.remember_signature(self._source(), key, ret.mojo)
+            except Exception:  # noqa: BLE001 - the memo is an optimisation
+                pass
             with self._lock:
                 self._variants[key] = call.dispatch
                 if self.verify:
@@ -232,6 +297,51 @@ class JitFunction:
         finally:
             with self._lock:
                 self._pending.discard(key)
+
+    def _warm_start(self, key: tuple, argtypes: list[Ty]):
+        """Dispatch natively on the first call, when a previous run left both
+        halves behind: the compiled library, and the return type it inferred.
+
+        Without this the JIT is useless to anything that calls a function once
+        - an agent's generated code runs, the profile records one call, the
+        process exits, and the library it could have used sits in the cache
+        unread. The cost of asking is a transpile (milliseconds) and a `stat`.
+        """
+        if key in self._warm_tried:
+            return None
+        self._warm_tried.add(key)
+        try:
+            verdict = cache.recall_verdict(self._source(), key)
+            if verdict.get("retired"):
+                # Another run already found this variant wrong or slower than
+                # the interpreter. Re-learning that costs the same as learning
+                # it did, in every worker, for ever.
+                with self._lock:
+                    self._failed.add(key)
+                    self.stats.last_error = f"retired earlier: {verdict['retired']}"
+                return None
+            remembered = verdict.get("ret")
+            if remembered is None:
+                return None
+            ret = types_by_mojo(remembered)
+            call, _ = compile_function(
+                self.fn, argtypes, ret, opt=self.opt, tree=self._tree_of(),
+                vectorize=self.vectorize, only_if_cached=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - warm start is never required
+            self.stats.last_error = f"warm start: {type(exc).__name__}: {exc}"
+            return None
+        if call is None:
+            return None
+        with self._lock:
+            self._variants[key] = call.dispatch
+            # Verification is skipped when a previous run already did it: the
+            # library is the same bytes, compiled from the same source by the
+            # same toolchain, and the answer cannot have changed.
+            if self.verify and not verdict.get("verified"):
+                self._unverified.add(key)
+            self.stats.warm_starts += 1
+        return call.dispatch
 
     def _signature_for(self, args) -> tuple[tuple, list[Ty]]:
         """Key the variant cache without paying for full inference each call.
@@ -262,6 +372,8 @@ class JitFunction:
             return self.fn(*args)
 
         call = self._variants.get(key)
+        if call is None and self.warm and key not in self._failed:
+            call = self._warm_start(key, argtypes)
         if call is not None:
             if key in self._unverified:
                 return self._verified_call(key, call, args)
@@ -312,13 +424,38 @@ class JitFunction:
         the price of one extra Python call per signature. A mismatch retires the
         variant permanently rather than raising: the answer the caller gets is
         always the Python one.
+
+        The same call is also timed, and a variant that is *slower* than the
+        interpreter is retired too. Crossing the C ABI copies any argument that
+        is not already a buffer, and copying a 200,000-element Python list costs
+        more than the loop it feeds - measured at 30ms native against 17ms
+        interpreted, while the same function on a numpy array is 0.2ms against
+        55ms. An accelerator that can lose is worse than none, because nobody
+        profiles the thing that is supposed to be the fast path.
         """
+        t0 = time.perf_counter()
         expected = self.fn(*args)
+        t1 = time.perf_counter()
         actual = call(*args)
+        t2 = time.perf_counter()
         self.stats.python_calls += 1
         with self._lock:
             self._unverified.discard(key)
         if _equalish(expected, actual):
+            python_seconds = t1 - t0
+            native_seconds = t2 - t1
+            if (python_seconds >= MIN_TIMED_SECONDS
+                    and native_seconds > python_seconds * SLOWER_THAN_PYTHON):
+                reason = (f"native {native_seconds * 1e3:.2f}ms vs "
+                          f"python {python_seconds * 1e3:.2f}ms")
+                with self._lock:
+                    self._variants.pop(key, None)
+                    self._failed.add(key)
+                    self.stats.retired_slower += 1
+                    self.stats.last_error = f"retired: {reason}"
+                self._record(key, retired=reason)
+                return expected
+            self._record(key, verified=True)
             self.stats.mojo_calls += 1
             return actual
         with self._lock:
@@ -328,7 +465,15 @@ class JitFunction:
             self.stats.last_error = (
                 f"verification failed: python={expected!r} mojo={actual!r}"
             )
+        self._record(key, retired=f"disagreed with CPython: {expected!r} != {actual!r}")
         return expected
+
+    def _record(self, key: tuple, **verdict) -> None:
+        """Persist a verdict, so no other process has to reach it again."""
+        try:
+            cache.remember_verdict(self._source(), key, **verdict)
+        except Exception:  # noqa: BLE001 - the memo is an optimisation
+            pass
 
     def wait(self, timeout: float = 600.0) -> bool:
         """Block until every in-flight compile finishes. Returns True if idle."""
@@ -355,6 +500,7 @@ def functools_wraps(wrapper, fn) -> None:
 
 def jit(fn=None, *, mode: str = "tiered", opt: int = 3, strict: bool = False,
         hot_calls: int = 1, hot_seconds: float = 0.0, verify: bool = False,
+        warm: bool = True, source: str | None = None,
         vectorize: bool = True):
     """Decorator: run `fn` in Mojo once it has been compiled for these types.
 
@@ -362,7 +508,8 @@ def jit(fn=None, *, mode: str = "tiered", opt: int = 3, strict: bool = False,
     proved it is worth several seconds of compiler; `verify` checks the first
     native result against CPython before trusting the variant.
     """
-    kwargs = dict(mode=mode, opt=opt, strict=strict, hot_calls=hot_calls,
+    kwargs = dict(mode=mode, opt=opt, strict=strict, warm=warm, source=source,
+                  hot_calls=hot_calls,
                   hot_seconds=hot_seconds, verify=verify, vectorize=vectorize)
     if fn is None:
         return lambda f: JitFunction(f, **kwargs)

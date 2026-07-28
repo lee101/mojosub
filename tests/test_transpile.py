@@ -1,4 +1,5 @@
 import math
+import time
 
 import pytest
 
@@ -8,7 +9,11 @@ from mojosub.types import ARRAY_F64, FLOAT, INT
 
 
 def test_scalar_roundtrip():
-    @jit(mode="blocking")
+    # warm=False so this asserts the cold contract - first call interpreted,
+    # later calls native. With warm start on, a library left in the cache by an
+    # earlier run makes even the first call native, which `test_warm_start_*`
+    # covers on purpose.
+    @jit(mode="blocking", warm=False)
     def poly(x: float, n: int) -> float:
         acc = 0.0
         for i in range(n):
@@ -186,7 +191,9 @@ def test_disk_cache_is_content_addressed():
 
 
 def test_hot_gating_delays_compilation():
-    @jit(mode="blocking", hot_calls=3)
+    # The gate exists to avoid paying a compiler for a function that may never
+    # run again, so it is only meaningful when there is a compile to pay for.
+    @jit(mode="blocking", hot_calls=3, warm=False)
     def acc(n: int) -> int:
         t = 0
         for i in range(n):
@@ -304,3 +311,161 @@ def test_gpu_rejects_shapes_it_cannot_map():
 
     with pytest.raises(Unsupported):
         compile_function(reduction, [ARRAY_F64], FLOAT, target="gpu")
+
+
+# -- warm start ------------------------------------------------------------
+#
+# The JIT used to be worthless to anything that calls a function once per
+# process - generated code, a request handler, a script. It ran CPython, noted
+# one call, and exited with the compiled library it could have used sitting
+# unread in the cache. Warm start reads it.
+
+
+def _agent_function(source: str, name: str):
+    """A function defined the way generated code arrives: exec of a string."""
+    ns = {"__mojosub_source__": source}
+    exec(compile(source, "<agent>", "exec"), ns)  # noqa: S102
+    return ns[name]
+
+
+AGENT_SRC = """
+def streak(xs: list[float], limit: float) -> int:
+    best = 0
+    run = 0
+    for i in range(len(xs)):
+        if xs[i] > limit:
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+    return best
+"""
+
+
+def test_source_can_be_supplied_for_code_that_has_no_file():
+    """`inspect.getsource` cannot see an exec'd function.
+
+    That refusal used to disqualify exactly the functions worth compiling.
+    """
+    fn = _agent_function(AGENT_SRC, "streak")
+    with pytest.raises(OSError):
+        import inspect
+
+        inspect.getsource(fn)
+
+    accelerated = jit(fn, mode="blocking", hot_calls=1, source=AGENT_SRC)
+    xs = [float(i % 7) for i in range(500)]
+    assert accelerated(xs, 3.0) == fn(xs, 3.0)
+    assert accelerated.compiled
+
+
+def test_source_is_found_in_the_namespace_it_was_exec_d_into():
+    """A caller that cannot pass `source=` can leave it in the globals."""
+    fn = _agent_function(AGENT_SRC, "streak")
+    accelerated = jit(fn, mode="blocking", hot_calls=1)
+    xs = [float(i % 5) for i in range(300)]
+    assert accelerated(xs, 2.0) == fn(xs, 2.0)
+    assert accelerated.compiled
+
+
+def test_warm_start_dispatches_natively_on_the_first_call():
+    fn = _agent_function(AGENT_SRC, "streak")
+    xs = [float(i % 9) for i in range(400)]
+
+    first = jit(fn, mode="blocking", hot_calls=1, source=AGENT_SRC)
+    first(xs, 4.0)
+    # Compiled here, or warm-started from a library an earlier test left in the
+    # cache - either way the library now exists, which is this test's premise.
+    assert first.compiled
+
+    # A second wrapper is a second process as far as the cache is concerned:
+    # no variants, no profile, only what is on disk.
+    second = jit(fn, mode="blocking", hot_calls=99, source=AGENT_SRC)
+    assert second(xs, 4.0) == fn(xs, 4.0)
+    assert second.stats.warm_starts == 1
+    assert second.stats.compiles == 0
+    assert second.stats.python_calls == 0, "warm start must not need CPython first"
+
+
+def test_warm_start_bypasses_the_hot_gate_only_because_nothing_is_compiled():
+    """The gate protects against paying a compiler, not against going fast."""
+    fn = _agent_function(AGENT_SRC, "streak")
+    xs = [float(i % 3) for i in range(200)]
+    jit(fn, mode="blocking", hot_calls=1, source=AGENT_SRC)(xs, 1.0)
+
+    gated = jit(fn, mode="blocking", hot_calls=1000, source=AGENT_SRC)
+    gated(xs, 1.0)
+    assert gated.compiled, "a cached library should be used whatever the gate says"
+
+
+def test_warm_start_off_restores_the_cold_path():
+    fn = _agent_function(AGENT_SRC, "streak")
+    xs = [float(i % 4) for i in range(120)]
+    jit(fn, mode="blocking", hot_calls=1, source=AGENT_SRC)(xs, 1.0)
+
+    cold = jit(fn, mode="blocking", hot_calls=1000, warm=False, source=AGENT_SRC)
+    cold(xs, 1.0)
+    assert not cold.compiled
+    assert cold.stats.warm_starts == 0
+
+
+def test_a_variant_slower_than_cpython_is_retired():
+    """Crossing the ABI copies a list; for a cheap loop over a long one that
+    costs more than it saves, and an accelerator that can lose is worse than
+    none, because nobody profiles the thing that is meant to be the fast path.
+
+    Both sides are stubbed with sleeps rather than raced for real: the decision
+    under test is the comparison, and a test that depends on how loaded the
+    machine is would be asserting something else.
+    """
+    from mojosub import api
+
+    # Its own source: retiring is now written to the cache, and a verdict about
+    # this test's stubbed timings must not follow the shared function around.
+    src = AGENT_SRC.replace("def streak", "def streak_retire")
+    fn = _agent_function(src, "streak_retire")
+    accelerated = jit(fn, mode="blocking", hot_calls=1, verify=True, source=src)
+    xs = [float(i % 6) for i in range(200)]
+    accelerated(xs, 2.0)
+    assert accelerated.compiled
+
+    key = next(iter(accelerated._variants))
+    native = accelerated._variants[key]
+    expected = fn(xs, 2.0)
+
+    def slow_native(*args):
+        time.sleep(0.05)
+        return native(*args)
+
+    def quick_python(*args):
+        time.sleep(0.005)     # over MIN_TIMED_SECONDS, so the guard judges
+        return expected
+
+    accelerated._variants[key] = slow_native
+    accelerated._unverified.add(key)
+    accelerated.fn = quick_python
+
+    assert accelerated(xs, 2.0) == expected
+    assert accelerated.stats.retired_slower == 1
+    assert "retired" in accelerated.stats.last_error
+    assert not accelerated.compiled
+
+    # and it stays retired: the answer keeps coming from the interpreter
+    assert accelerated(xs, 2.0) == expected
+    assert api.SLOWER_THAN_PYTHON > 1.0
+
+
+def test_a_short_call_is_not_judged_on_timing_noise():
+    """A 50-microsecond sample cannot tell fast from slow, and a variant
+    retired on one never comes back - not even for a million rows."""
+    from mojosub import api
+
+    assert api.MIN_TIMED_SECONDS > 0
+    fn = _agent_function(AGENT_SRC, "streak")
+    accelerated = jit(fn, mode="blocking", hot_calls=1, verify=True, source=AGENT_SRC)
+    tiny = [1.0, 2.0, 3.0]
+    accelerated(tiny, 1.5)
+    accelerated(tiny, 1.5)
+    assert accelerated.stats.retired_slower == 0
+    assert accelerated.compiled

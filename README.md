@@ -204,6 +204,58 @@ design, including what does *not* work.
 - [mojo-notebook](https://github.com/lee101/mojo-notebook) — reactive Python + Mojo notebooks
 - [mojo-wasm](https://github.com/lee101/mojo-wasm) — compile Mojo to WebAssembly
 
+## Warm start
+
+The first call to a `@jit` function runs CPython — that is how the return type
+is learned when there are no annotations — and the compile happens behind it.
+For anything called *once per process*, that used to mean the JIT never helped
+at all: generated code ran interpreted, the profile recorded one call, the
+process exited, and the library it could have used sat in the cache unread.
+
+The cache now remembers the inferred signature alongside the library, so a
+function whose unit is already built dispatches natively on call **one**, in a
+process that has never seen it:
+
+```python
+fn = jit(generated, source=src)   # a later request, same generated code
+fn(prices, 30)                    # native immediately: no CPython, no compile
+fn.stats.warm_starts              # 1
+```
+
+Verification is remembered the same way. `verify=True` costs a full interpreted
+run, so checking once per *process* meant checking on every request; the verdict
+is a fact about a (source, signature, toolchain) triple and is now stored with
+the library. A variant that disagreed with CPython, or that measured slower than
+it, is recorded as retired and no other process re-discovers it.
+
+## Code that has no file
+
+`inspect.getsource` cannot see a function defined by `exec` of a string, which
+is how generated code arrives — so the functions most worth compiling were the
+ones this used to refuse, with `OSError: could not get source code`. Hand the
+source over instead:
+
+```python
+jit(fn, source=src)                       # explicitly
+ns = {"__mojosub_source__": src}          # or leave it where the function lives
+exec(compile(src, "<agent>", "exec"), ns)
+```
+
+## It cannot be slower than the interpreter
+
+Crossing the C ABI copies any argument that is not already a buffer. On a
+200,000-element **Python list** that copy costs more than the loop it feeds:
+
+| input | CPython | mojosub |
+| --- | --- | --- |
+| `list[float]`, 200k | 17 ms | 30 ms |
+| `numpy` float64, 200k | 55 ms | **0.23 ms** |
+
+So the first verified call is timed as well as compared, and a variant slower
+than the interpreter is retired and remembered as retired. An accelerator that
+can lose is worse than none, because nobody profiles the thing that is supposed
+to be the fast path. Pass numpy arrays, not lists.
+
 ## License
 
 MIT

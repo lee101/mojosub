@@ -4,11 +4,20 @@ A unit's key is the hash of its Mojo source plus the compiler version and
 flags, so a cache hit is safe across processes and machines with the same
 toolchain. Builds are done to a temp file and renamed, which makes a
 concurrent build racy but never corrupt.
+
+The cache also remembers **inferred signatures**. Knowing that a library exists
+is not enough to call it: the transpiler needs the return type, which is
+normally learned by running the function under CPython once. Recording it here
+means a function whose library is already on disk can be dispatched natively on
+its *first* call in a new process - which is the difference between the JIT
+helping and not helping at all for code that runs once per request, like an
+agent's generated pandas loop.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 
@@ -27,23 +36,23 @@ def key_for(source: str, opt: int) -> str:
     return h.hexdigest()[:32]
 
 
-def lib_path(key: str, root: str = DEFAULT_ROOT) -> str:
-    return os.path.join(root, key + ".so")
+def lib_path(key: str, root: str | None = None) -> str:
+    return os.path.join(_root(root), key + ".so")
 
 
-def lookup(source: str, opt: int = 3, root: str = DEFAULT_ROOT) -> str | None:
+def lookup(source: str, opt: int = 3, root: str | None = None) -> str | None:
     path = lib_path(key_for(source, opt), root)
     return path if os.path.exists(path) else None
 
 
-def compile_unit(source: str, opt: int = 3, root: str = DEFAULT_ROOT) -> str:
+def compile_unit(source: str, opt: int = 3, root: str | None = None) -> str:
     """Return the path to a shared library for `source`, building if needed."""
     key = key_for(source, opt)
     final = lib_path(key, root)
     if os.path.exists(final):
         return final
-    os.makedirs(root, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=root) as tmp:
+    os.makedirs(_root(root), exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=_root(root)) as tmp:
         src_path = os.path.join(tmp, "unit.mojo")
         with open(src_path, "w") as fh:
             fh.write(source)
@@ -55,12 +64,111 @@ def compile_unit(source: str, opt: int = 3, root: str = DEFAULT_ROOT) -> str:
     return final
 
 
-def clear(root: str = DEFAULT_ROOT) -> int:
+# -- remembered signatures -------------------------------------------------
+
+
+def _root(root: str | None) -> str:
+    """Resolved at call time, so a test (or a caller) can redirect the cache
+    by setting `DEFAULT_ROOT` without every default argument having captured
+    the old value at import."""
+    return root or DEFAULT_ROOT
+
+
+def _sig_path(source_key: str, root: str | None = None) -> str:
+    return os.path.join(_root(root), "sigs", source_key + ".json")
+
+
+def source_key(py_source: str) -> str:
+    """Key for a *Python* function body, independent of the toolchain.
+
+    Deliberately not `key_for`: a signature is a fact about the function, not
+    about the compiler, so it survives a Mojo upgrade that invalidates every
+    compiled library.
+    """
+    h = hashlib.sha256()
+    h.update(b"pysig|v1|")
+    h.update(py_source.encode())
+    return h.hexdigest()[:32]
+
+
+def _read_table(py_source: str, root: str) -> dict:
+    try:
+        with open(_sig_path(source_key(py_source), root)) as fh:
+            table = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    # An older cache stored the return type as a bare string.
+    return {
+        k: (v if isinstance(v, dict) else {"ret": v})
+        for k, v in table.items()
+    }
+
+
+def _write_entry(py_source: str, argtypes: tuple, patch: dict, root: str) -> None:
+    path = _sig_path(source_key(py_source), root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    table = _read_table(py_source, root)
+    entry = table.get("|".join(argtypes), {})
+    entry.update(patch)
+    table["|".join(argtypes)] = entry
+    tmp = path + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(table, fh)
+    os.replace(tmp, path)  # concurrent writers race, never tear
+
+
+def remember_signature(py_source: str, argtypes: tuple, ret: str,
+                       root: str | None = None) -> None:
+    """Record what this function returned for these argument types."""
+    _write_entry(py_source, argtypes, {"ret": ret}, root)
+
+
+def recall_signature(py_source: str, argtypes: tuple,
+                     root: str | None = None) -> str | None:
+    return _read_table(py_source, root).get("|".join(argtypes), {}).get("ret")
+
+
+def remember_verdict(py_source: str, argtypes: tuple, *, verified: bool | None = None,
+                     retired: str | None = None, root: str | None = None) -> None:
+    """Record the outcome of checking a compiled variant against CPython.
+
+    Verification costs a full interpreted run, so doing it once per *process*
+    means a function called once per request is checked on every request and
+    the compiled path never actually replaces anything - which measured as a
+    1.4x gain where the compiled code itself is 200x. The check is a fact about
+    a (source, signature, toolchain) triple, so it belongs on disk with the
+    library it is about.
+
+    `retired` is the same decision in the other direction: a variant that
+    disagreed with CPython, or was slower than it, is not worth re-discovering
+    in every worker.
+    """
+    patch: dict = {}
+    if verified is not None:
+        patch["verified"] = verified
+    if retired is not None:
+        patch["retired"] = retired
+    if patch:
+        _write_entry(py_source, argtypes, patch, root)
+
+
+def recall_verdict(py_source: str, argtypes: tuple,
+                   root: str | None = None) -> dict:
+    return _read_table(py_source, root).get("|".join(argtypes), {})
+
+
+def clear(root: str | None = None) -> int:
     n = 0
+    root = _root(root)
     if not os.path.isdir(root):
         return 0
     for name in os.listdir(root):
         if name.endswith(".so") or name.endswith(".so.mojo"):
             os.remove(os.path.join(root, name))
+            n += 1
+    sigs = os.path.join(root, "sigs")
+    if os.path.isdir(sigs):
+        for name in os.listdir(sigs):
+            os.remove(os.path.join(sigs, name))
             n += 1
     return n
