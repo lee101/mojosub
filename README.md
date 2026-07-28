@@ -196,6 +196,14 @@ non-parametric, mutable pointer — and `@export` rejects parametric functions.
 See [`docs/research.md`](docs/research.md) for the measurements behind the
 design, including what does *not* work.
 
+## Related
+
+- [mojo-sklearn](https://github.com/lee101/mojo-sklearn) — scikit-learn's core estimators in Mojo
+- [mojo-arrow](https://github.com/lee101/mojo-arrow) — Arrow compute kernels
+- [mojo-plotly](https://github.com/lee101/mojo-plotly) — plotly figures with Mojo kernels
+- [mojo-notebook](https://github.com/lee101/mojo-notebook) — reactive Python + Mojo notebooks
+- [mojo-wasm](https://github.com/lee101/mojo-wasm) — compile Mojo to WebAssembly
+
 ## License
 
 MIT
