@@ -251,10 +251,31 @@ Crossing the C ABI copies any argument that is not already a buffer. On a
 | `list[float]`, 200k | 17 ms | 30 ms |
 | `numpy` float64, 200k | 55 ms | **0.23 ms** |
 
-So the first verified call is timed as well as compared, and a variant slower
-than the interpreter is retired and remembered as retired. An accelerator that
-can lose is worse than none, because nobody profiles the thing that is supposed
-to be the fast path. Pass numpy arrays, not lists.
+So the two tiers are **raced** before the compiled one is trusted: each trial
+call runs both, times both, and the slower one loses. An accelerator that can
+lose is worse than none, because nobody profiles the thing that is supposed to
+be the fast path. Pass numpy arrays, not lists.
+
+The race is short by design:
+
+- it stops the moment one side is ahead by `RACE_DECISIVE` (4x), which is the
+  usual case — a 200x kernel costs exactly one extra interpreted call;
+- only a genuinely close result runs the full `RACE_CALLS` (3) samples, and the
+  verdict is the **median**, not one sample. A single pair of timings has the
+  native side paying a first-call page-in against an interpreted call that just
+  warmed the caches for it, and the verdict is permanent;
+- calls where both tiers finish inside timer noise are not judged at all;
+- the outcome is written to the cache next to the library (`raced`, `speedup`),
+  so the next process — and every other worker — dispatches natively on call
+  one without re-racing anything.
+
+`MOJOSUB_RACE=0` dispatches natively as soon as a variant exists;
+`MOJOSUB_RACE_CALLS` and `MOJOSUB_RACE_DECISIVE` tune the rest.
+
+A kernel that writes through its buffer argument is handled specially: running
+both tiers back to back would apply the transform twice. Each tier runs against
+the original contents, the interpreted tier's writes are compared under
+`verify=True`, and the native tier's writes are what the caller keeps.
 
 ## License
 

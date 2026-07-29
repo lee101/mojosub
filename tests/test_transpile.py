@@ -4,7 +4,7 @@ import time
 import pytest
 
 from mojosub import Unsupported, execute, jit
-from mojosub.api import compile_function
+from mojosub.api import RACE_CALLS as RACE_SETTLE_CALLS, compile_function
 from mojosub.types import ARRAY_F64, FLOAT, INT
 
 
@@ -443,7 +443,7 @@ def test_a_variant_slower_than_cpython_is_retired():
         return expected
 
     accelerated._variants[key] = slow_native
-    accelerated._unverified.add(key)
+    accelerated._trials[key] = []
     accelerated.fn = quick_python
 
     assert accelerated(xs, 2.0) == expected
@@ -469,3 +469,91 @@ def test_a_short_call_is_not_judged_on_timing_noise():
     accelerated(tiny, 1.5)
     assert accelerated.stats.retired_slower == 0
     assert accelerated.compiled
+
+
+def test_racing_a_kernel_that_writes_its_buffer_applies_it_once():
+    """Both tiers run on the same call while the race is on. A kernel that
+    writes through its argument would then be applied twice, and the caller
+    would get a doubled array out of what is only supposed to be a
+    measurement - so each tier runs against the original contents and the
+    native one's writes are what survives."""
+    np = pytest.importorskip("numpy")
+
+    @jit(mode="blocking", verify=True)
+    def double_in_place(xs: list[float], k: float) -> float:
+        t = 0.0
+        for i in range(len(xs)):
+            xs[i] = xs[i] * k
+            t += xs[i]
+        return t
+
+    for _ in range(RACE_SETTLE_CALLS + 2):
+        arr = np.arange(1024, dtype=float)
+        total = double_in_place(arr, 2.0)
+        assert total == pytest.approx(float(np.arange(1024).sum() * 2))
+        assert arr[1] == pytest.approx(2.0)   # not 4.0
+    assert double_in_place.stats.verify_failures == 0
+
+
+def test_race_verdict_needs_more_than_one_close_sample():
+    """A close result is sampled again; a decisive one is not.
+
+    The first native call pays a page-in that the interpreted call it is
+    compared against has just warmed the caches for, so a single close sample
+    is not evidence. A landslide is, and stopping early on it is what keeps the
+    race down to one extra interpreted call in the case that actually matters.
+    """
+    from mojosub.api import RACE_CALLS, _race_verdict
+
+    close = (0.010, 0.013)
+    verdict, _, _ = _race_verdict([close])
+    assert verdict is None
+    verdict, _, _ = _race_verdict([close] * RACE_CALLS)
+    assert verdict == "retire"
+
+    # decisive either way, settled on the first sample
+    assert _race_verdict([(0.100, 0.002)])[0] == "keep"
+    assert _race_verdict([(0.002, 0.100)])[0] == "retire"
+
+
+def test_race_takes_the_median_not_the_worst_sample():
+    """One descheduled call must not retire a variant that is really faster."""
+    from mojosub.api import RACE_CALLS, _race_verdict
+
+    assert RACE_CALLS >= 3
+    samples = [(0.010, 0.009), (0.010, 0.400), (0.010, 0.009)]
+    verdict, python_seconds, native_seconds = _race_verdict(samples)
+    assert verdict == "keep"
+    assert native_seconds < python_seconds
+
+
+def test_a_won_race_is_persisted_so_the_next_process_skips_it():
+    """The race costs interpreted calls, which is what compiling was supposed
+    to stop paying for. It is a fact about (source, signature, toolchain), so
+    it belongs on disk next to the library it is about."""
+    np = pytest.importorskip("numpy")
+    from mojosub import cache
+
+    src = AGENT_SRC.replace("def streak", "def streak_raced")
+    fn = _agent_function(src, "streak_raced")
+    accelerated = jit(fn, mode="blocking", hot_calls=1, verify=True, source=src)
+    # numpy, not a list: a list is copied across the ABI and the race would
+    # correctly conclude that the interpreter wins.
+    xs = np.arange(200000, dtype=float) % 6.0
+    for _ in range(RACE_SETTLE_CALLS + 1):
+        accelerated(xs, 2.0)
+    key = next(iter(accelerated._variants))
+    assert key not in accelerated._trials
+
+    verdict = cache.recall_verdict(accelerated._source(), key)
+    assert verdict.get("raced") is True
+    assert verdict.get("speedup", 0) > 0
+
+    # a fresh wrapper over the same source warm-starts straight into native
+    # dispatch, with no interpreted call spent re-deciding
+    again = jit(_agent_function(src, "streak_raced"), mode="blocking",
+                hot_calls=1, verify=True, source=src)
+    again(xs, 2.0)
+
+    assert again.stats.warm_starts == 1
+    assert again.stats.python_calls == 0

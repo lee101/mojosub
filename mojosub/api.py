@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
+import statistics
 import textwrap
 import threading
 import time
@@ -33,15 +35,31 @@ __all__ = [
 
 
 # How much slower than CPython a compiled variant may be before it is retired.
-# Slightly over 1.0 because the two timings are single samples and the compiled
-# side pays a first-call page-in; a variant that is genuinely faster clears this
-# by an order of magnitude, so the tolerance costs nothing real.
+# Slightly over 1.0 because the compiled side pays a first-call page-in; a
+# variant that is genuinely faster clears this by an order of magnitude, so the
+# tolerance costs nothing real.
 SLOWER_THAN_PYTHON = 1.1
 
-# A call this short is not worth judging: the two samples are dominated by
-# timer noise, and a variant retired on a 50-microsecond sample never comes
-# back - not even when the next call arrives with a million rows behind it.
+# A call this short is not worth judging: the samples are dominated by timer
+# noise, and a variant retired on a 50-microsecond sample never comes back -
+# not even when the next call arrives with a million rows behind it.
 MIN_TIMED_SECONDS = 0.001
+
+# How many calls the two tiers run side by side before the slower one is
+# dropped. One sample is not a measurement: the first native call pays a
+# page-in and the first interpreted call may have warmed the caches for it,
+# and a wrong verdict here is permanent and persisted. Three medians cost
+# three interpreted calls, once per (source, signature, toolchain).
+RACE_CALLS = max(1, int(os.environ.get("MOJOSUB_RACE_CALLS", "3")))
+
+# A gap this wide is not noise. The race stops the moment either side wins by
+# this factor, so the common case - native is 50x ahead - pays exactly one
+# extra interpreted call, and only genuinely close calls run the full race.
+RACE_DECISIVE = float(os.environ.get("MOJOSUB_RACE_DECISIVE", "4.0"))
+
+# Set to 0 to dispatch natively as soon as a variant exists, without ever
+# timing it against the interpreter.
+RACE_ENABLED = os.environ.get("MOJOSUB_RACE", "1") != "0"
 
 
 def type_of(value) -> Ty:
@@ -79,6 +97,59 @@ def _equalish(a, b, rtol: float = 1e-9) -> bool:
     return a == b
 
 
+def _is_buffer(value) -> bool:
+    """Whether this argument is one the compiled code can write through."""
+    if isinstance(value, list):
+        return True
+    if getattr(value, "__array_interface__", None) is not None:
+        return True
+    import array as _array
+
+    return isinstance(value, _array.array)
+
+
+def _snapshot(value):
+    return value.copy() if hasattr(value, "copy") else value[:]
+
+
+def _restore(value, saved) -> None:
+    value[:] = saved
+
+
+def _buffers_equal(a, b) -> bool:
+    if len(a) != len(b):
+        return False
+    return all(_equalish(x, y) for x, y in zip(list(a), list(b)))
+
+
+def _race_verdict(samples: list[tuple[float, float]]):
+    """Decide between the two tiers from the samples so far.
+
+    Returns `(verdict, python_seconds, native_seconds)` where verdict is
+    `"keep"`, `"retire"`, or `None` for "not decided, sample again". Medians,
+    not means: one descheduled call must not be able to move the answer.
+    """
+    python_seconds = statistics.median(s[0] for s in samples)
+    native_seconds = statistics.median(s[1] for s in samples)
+
+    if python_seconds < MIN_TIMED_SECONDS and native_seconds < MIN_TIMED_SECONDS:
+        # Both tiers finish inside timer noise. There is nothing here worth
+        # measuring and nothing worth losing either - keep the compiled one
+        # and stop paying for interpreted calls.
+        return "keep", python_seconds, native_seconds
+    if native_seconds * RACE_DECISIVE < python_seconds:
+        return "keep", python_seconds, native_seconds
+    if (python_seconds >= MIN_TIMED_SECONDS
+            and python_seconds * RACE_DECISIVE < native_seconds):
+        return "retire", python_seconds, native_seconds
+    if len(samples) < RACE_CALLS:
+        return None, python_seconds, native_seconds
+    if (python_seconds >= MIN_TIMED_SECONDS
+            and native_seconds > python_seconds * SLOWER_THAN_PYTHON):
+        return "retire", python_seconds, native_seconds
+    return "keep", python_seconds, native_seconds
+
+
 @dataclass
 class Stats:
     python_calls: int = 0
@@ -89,6 +160,8 @@ class Stats:
     cache_hits: int = 0
     verify_failures: int = 0
     retired_slower: int = 0
+    raced_calls: int = 0
+    speedup: float | None = None
     last_error: str | None = None
 
 
@@ -250,7 +323,9 @@ class JitFunction:
         self._variants: dict[tuple, _Callable] = {}
         self._pending: set[tuple] = set()
         self._failed: set[tuple] = set()
-        self._unverified: set[tuple] = set()
+        # key -> [(python_seconds, native_seconds), ...] while the two tiers
+        # are still being raced against each other. Absent means decided.
+        self._trials: dict[tuple, list[tuple[float, float]]] = {}
         self._profile: dict[tuple, list] = {}   # key -> [calls, seconds]
         self._lock = threading.Lock()
         self._tree: ast.Module | None = None
@@ -284,8 +359,8 @@ class JitFunction:
                 pass
             with self._lock:
                 self._variants[key] = call.dispatch
-                if self.verify:
-                    self._unverified.add(key)
+                if self.verify or RACE_ENABLED:
+                    self._trials[key] = []
                 self.stats.compiles += 1
                 self.stats.compile_seconds += time.perf_counter() - started
         except Exception as exc:  # noqa: BLE001 - fallback is the contract
@@ -335,11 +410,18 @@ class JitFunction:
             return None
         with self._lock:
             self._variants[key] = call.dispatch
-            # Verification is skipped when a previous run already did it: the
-            # library is the same bytes, compiled from the same source by the
-            # same toolchain, and the answer cannot have changed.
-            if self.verify and not verdict.get("verified"):
-                self._unverified.add(key)
+            # Verification and the timing race are both skipped when a previous
+            # run already settled them: the library is the same bytes, compiled
+            # from the same source by the same toolchain, so neither the answer
+            # nor which tier is faster can have changed. This is the whole
+            # point of persisting the verdict - a function called once per
+            # request must not re-race itself on every request.
+            needs_verify = self.verify and not verdict.get("verified")
+            needs_race = RACE_ENABLED and not verdict.get("raced")
+            if needs_verify or needs_race:
+                self._trials[key] = []
+            elif verdict.get("speedup"):
+                self.stats.speedup = verdict["speedup"]
             self.stats.warm_starts += 1
         return call.dispatch
 
@@ -375,8 +457,8 @@ class JitFunction:
         if call is None and self.warm and key not in self._failed:
             call = self._warm_start(key, argtypes)
         if call is not None:
-            if key in self._unverified:
-                return self._verified_call(key, call, args)
+            if key in self._trials:
+                return self._trial_call(key, call, args)
             self.stats.mojo_calls += 1
             return call(*args)
         if key in self._failed:
@@ -416,57 +498,119 @@ class JitFunction:
             ).start()
         return result
 
-    def _verified_call(self, key, call, args):
-        """Run both tiers once and compare before trusting the compiled one.
+    def _trial_call(self, key, call, args):
+        """Run both tiers, compare them, and keep whichever one deserves to win.
 
-        Mojo's Int is 64-bit and wraps where CPython promotes, and a vectorized
-        reduction sums in a different order, so `verify=True` buys certainty for
-        the price of one extra Python call per signature. A mismatch retires the
-        variant permanently rather than raising: the answer the caller gets is
-        always the Python one.
+        Two separate questions are settled here, and both need an interpreted
+        call, so they share one.
 
-        The same call is also timed, and a variant that is *slower* than the
-        interpreter is retired too. Crossing the C ABI copies any argument that
-        is not already a buffer, and copying a 200,000-element Python list costs
-        more than the loop it feeds - measured at 30ms native against 17ms
-        interpreted, while the same function on a numpy array is 0.2ms against
-        55ms. An accelerator that can lose is worse than none, because nobody
-        profiles the thing that is supposed to be the fast path.
+        Correctness: Mojo's Int is 64-bit and wraps where CPython promotes, and
+        a vectorized reduction sums in a different order, so `verify=True` buys
+        certainty for the price of one extra Python call per signature. A
+        mismatch retires the variant permanently rather than raising - the
+        answer the caller gets is always the Python one.
+
+        Speed: native is not automatically faster. Crossing the C ABI copies any
+        argument that is not already a buffer, and copying a 200,000-element
+        Python list costs more than the loop it feeds - measured at 30ms native
+        against 17ms interpreted, while the same function on a numpy array is
+        0.2ms against 55ms. An accelerator that can lose is worse than none,
+        because nobody profiles the thing that is supposed to be the fast path.
+
+        The verdict comes from a race rather than a single sample: one pair of
+        timings has the native side paying a first-call page-in and the
+        interpreted side warming the caches for it, and the decision is
+        permanent and written to disk. The race stops early the moment one side
+        is ahead by `RACE_DECISIVE`, which is the usual case - so a 50x win
+        costs one interpreted call, and only a genuinely close result pays for
+        `RACE_CALLS` of them.
         """
+        # A kernel that writes through its buffer argument must not see the
+        # other tier's writes: running both back to back would apply the
+        # transform twice, and the caller would get a doubled array out of what
+        # is supposed to be a measurement. Each tier runs against the original
+        # contents, and what the caller keeps is the native tier's result.
+        buffers = [a for a in args if _is_buffer(a)]
+        before = [_snapshot(b) for b in buffers]
+
         t0 = time.perf_counter()
         expected = self.fn(*args)
         t1 = time.perf_counter()
-        actual = call(*args)
+        python_seconds = t1 - t0
+
+        after_python = [_snapshot(b) for b in buffers]
+        for buf, saved in zip(buffers, before):
+            _restore(buf, saved)
+
         t2 = time.perf_counter()
+        actual = call(*args)
+        native_seconds = time.perf_counter() - t2
+
         self.stats.python_calls += 1
-        with self._lock:
-            self._unverified.discard(key)
-        if _equalish(expected, actual):
-            python_seconds = t1 - t0
-            native_seconds = t2 - t1
-            if (python_seconds >= MIN_TIMED_SECONDS
-                    and native_seconds > python_seconds * SLOWER_THAN_PYTHON):
-                reason = (f"native {native_seconds * 1e3:.2f}ms vs "
-                          f"python {python_seconds * 1e3:.2f}ms")
-                with self._lock:
-                    self._variants.pop(key, None)
-                    self._failed.add(key)
-                    self.stats.retired_slower += 1
-                    self.stats.last_error = f"retired: {reason}"
-                self._record(key, retired=reason)
-                return expected
-            self._record(key, verified=True)
-            self.stats.mojo_calls += 1
-            return actual
-        with self._lock:
-            self._variants.pop(key, None)
-            self._failed.add(key)
-            self.stats.verify_failures += 1
-            self.stats.last_error = (
-                f"verification failed: python={expected!r} mojo={actual!r}"
+        self.stats.raced_calls += 1
+
+        agreed = not self.verify or (
+            _equalish(expected, actual)
+            and all(_buffers_equal(p, b) for p, b in zip(after_python, buffers))
+        )
+        if not agreed:
+            with self._lock:
+                self._trials.pop(key, None)
+                self._variants.pop(key, None)
+                self._failed.add(key)
+                self.stats.verify_failures += 1
+                self.stats.last_error = (
+                    f"verification failed: python={expected!r} mojo={actual!r}"
+                )
+            self._record(
+                key, retired=f"disagreed with CPython: {expected!r} != {actual!r}"
             )
-        self._record(key, retired=f"disagreed with CPython: {expected!r} != {actual!r}")
-        return expected
+            # The buffers hold the native writes; the answer the caller gets is
+            # the interpreted one, in every respect.
+            for buf, saved in zip(buffers, after_python):
+                _restore(buf, saved)
+            return expected
+
+        with self._lock:
+            samples = self._trials.get(key)
+            if samples is None:
+                # Another thread settled this signature while this call was in
+                # flight. Its verdict stands.
+                self.stats.mojo_calls += 1
+                return actual
+            samples.append((python_seconds, native_seconds))
+            verdict, median_python, median_native = _race_verdict(samples)
+            if verdict is None:
+                self.stats.mojo_calls += 1
+                return actual
+            self._trials.pop(key, None)
+            speedup = (median_python / median_native) if median_native > 0 else None
+            if verdict == "retire":
+                reason = (f"native {median_native * 1e3:.2f}ms vs "
+                          f"python {median_python * 1e3:.2f}ms "
+                          f"over {len(samples)} calls")
+                self._variants.pop(key, None)
+                self._failed.add(key)
+                self.stats.retired_slower += 1
+                self.stats.last_error = f"retired: {reason}"
+            else:
+                self.stats.mojo_calls += 1
+                self.stats.speedup = speedup
+
+        if verdict == "retire":
+            self._record(key, retired=reason)
+            for buf, saved in zip(buffers, after_python):
+                _restore(buf, saved)
+            return expected
+        # `verified` is only a fact when there was something to compare; with
+        # verify off the race says which tier is faster and nothing more.
+        self._record(
+            key,
+            verified=True if self.verify else None,
+            raced=True,
+            speedup=speedup,
+        )
+        return actual
 
     def _record(self, key: tuple, **verdict) -> None:
         """Persist a verdict, so no other process has to reach it again."""

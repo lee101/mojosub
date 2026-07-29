@@ -129,7 +129,8 @@ def recall_signature(py_source: str, argtypes: tuple,
 
 
 def remember_verdict(py_source: str, argtypes: tuple, *, verified: bool | None = None,
-                     retired: str | None = None, root: str | None = None) -> None:
+                     retired: str | None = None, raced: bool | None = None,
+                     speedup: float | None = None, root: str | None = None) -> None:
     """Record the outcome of checking a compiled variant against CPython.
 
     Verification costs a full interpreted run, so doing it once per *process*
@@ -142,12 +143,21 @@ def remember_verdict(py_source: str, argtypes: tuple, *, verified: bool | None =
     `retired` is the same decision in the other direction: a variant that
     disagreed with CPython, or was slower than it, is not worth re-discovering
     in every worker.
+
+    `raced` records that the two tiers have been timed against each other and
+    the compiled one won, with `speedup` as the measured ratio. Without it the
+    race repeats in every process, and the race costs interpreted calls -
+    exactly what compiling was supposed to stop paying for.
     """
     patch: dict = {}
     if verified is not None:
         patch["verified"] = verified
     if retired is not None:
         patch["retired"] = retired
+    if raced is not None:
+        patch["raced"] = raced
+    if speedup is not None:
+        patch["speedup"] = round(float(speedup), 3)
     if patch:
         _write_entry(py_source, argtypes, patch, root)
 
