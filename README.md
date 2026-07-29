@@ -272,6 +272,13 @@ The race is short by design:
 `MOJOSUB_RACE=0` dispatches natively as soon as a variant exists;
 `MOJOSUB_RACE_CALLS` and `MOJOSUB_RACE_DECISIVE` tune the rest.
 
+A numpy array and a Python list of the same element type compile to identical
+Mojo, so they used to share a signature key — and a verdict reached on one
+silenced the race on the other, in both directions. They are keyed apart now.
+The library is still shared (same source, same content-addressed entry); only
+the question of which tier is faster is answered separately, because it has
+different answers.
+
 A kernel that writes through its buffer argument is handled specially: running
 both tiers back to back would apply the transform twice. Each tier runs against
 the original contents, the interpreted tier's writes are compared under

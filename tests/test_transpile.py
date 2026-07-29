@@ -557,3 +557,25 @@ def test_a_won_race_is_persisted_so_the_next_process_skips_it():
 
     assert again.stats.warm_starts == 1
     assert again.stats.python_calls == 0
+
+
+def test_a_list_and_an_array_do_not_share_a_verdict():
+    """They compile to the same Mojo, so they used to share a signature key -
+    but one crosses the ABI as a pointer and the other is copied element by
+    element, which is the difference between the compiled variant winning and
+    losing. A verdict reached on one must not silence the race on the other."""
+    np = pytest.importorskip("numpy")
+
+    src = AGENT_SRC.replace("def streak", "def streak_keyed")
+    fn = _agent_function(src, "streak_keyed")
+    accelerated = jit(fn, mode="blocking", hot_calls=1, verify=True, source=src)
+
+    accelerated(np.arange(4096, dtype=float) % 7.0, 2.0)
+    accelerated(np.arange(4096, dtype=float) % 7.0, 2.0)
+    array_keys = set(accelerated._variants) | set(accelerated._failed)
+
+    accelerated([float(i % 7) for i in range(4096)], 2.0)
+    accelerated([float(i % 7) for i in range(4096)], 2.0)
+    all_keys = set(accelerated._variants) | set(accelerated._failed)
+
+    assert len(all_keys) == len(array_keys) + 1

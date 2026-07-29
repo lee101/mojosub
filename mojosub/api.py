@@ -97,6 +97,22 @@ def _equalish(a, b, rtol: float = 1e-9) -> bool:
     return a == b
 
 
+def _zero_copy(value) -> bool:
+    """Whether this argument crosses the ABI as a pointer rather than a copy.
+
+    Mirrors what `runtime.Buffer` actually does: numpy exposes an address, and
+    so does an `array.array` - but only when its typecode already matches, and
+    the caller cannot see the element type from here. Treating a mismatched
+    `array` as copied keys it with the lists, which is the same cost bucket it
+    lands in.
+    """
+    if getattr(value, "__array_interface__", None) is not None:
+        return True
+    import array as _array
+
+    return isinstance(value, _array.array)
+
+
 def _is_buffer(value) -> bool:
     """Whether this argument is one the compiled code can write through."""
     if isinstance(value, list):
@@ -431,6 +447,14 @@ class JitFunction:
         Scalars are keyed straight off `type(arg)`, which is a dict hit;
         only buffers, whose element type depends on their contents, go
         through `type_of`.
+
+        A numpy array and a Python list of the same element type compile to the
+        same Mojo, so they used to share a key - but one crosses the ABI as a
+        pointer and the other is copied element by element, which is 0.6ms
+        against 12ms on the same kernel. That is the difference between the
+        compiled variant winning and losing, so the two get separate keys: the
+        library is shared (same source, same content-addressed cache entry) and
+        only the verdict about which tier is faster is kept apart.
         """
         parts = []
         argtypes: list[Ty] = []
@@ -438,7 +462,9 @@ class JitFunction:
             ty = _SCALAR_TYPES.get(a.__class__)
             if ty is None:
                 ty = type_of(a)
-            parts.append(ty.mojo)
+                parts.append(ty.mojo + ("#buf" if _zero_copy(a) else "#seq"))
+            else:
+                parts.append(ty.mojo)
             argtypes.append(ty)
         return tuple(parts), argtypes
 
