@@ -164,15 +164,24 @@ measurement, not a guess.
 
 Supported: `int` / `float` / `bool` scalars, flat `float64` and `int64` buffers
 (numpy, `array.array`, or a list — a list is copied in and written back),
+row-major 2-D numpy arrays (`m[i, j]`, `m.shape[0]`, `m.shape[1]`),
 arithmetic and comparison and boolean operators, `if` / `while` / `for i in
 range(...)` / `break` / `continue`, conditional expressions, indexed loads and
 stores, `len()` of a buffer, `int()` / `float()` / `bool()` / `abs()` / `min()`
 / `max()`, the usual `math` functions, recursion, and calls to other annotated
 functions defined alongside it.
 
+A local may change type the way Python's does: `t = 0` followed by `t += x` is
+declared at the *join* of everything assigned to it, because a Mojo `var` gets
+one type for ever and picking the first one truncated the rest. A parameter or
+a loop counter cannot be widened that way — its type is fixed by the ABI or by
+its `range` — so reassigning one to something wider is refused.
+
 Not supported, and falling back to CPython on sight: strings, dicts, classes,
-closures, comprehensions, generators, exceptions, `None`-typed values, 2-D
-arrays, and anything imported from outside the unit.
+closures, comprehensions, generators, exceptions, `None`-typed values,
+non-contiguous or 3-D arrays, `int ** n` where `n` could be negative (CPython
+returns a float there and Mojo cannot), and anything imported from outside the
+unit.
 
 **Integers are 64-bit and they wrap.** CPython promotes to arbitrary precision;
 Mojo does not. A kernel whose intermediate values exceed 2^63 will disagree with

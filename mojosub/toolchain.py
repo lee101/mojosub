@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import shutil
+import signal
 import subprocess
 
 
@@ -44,11 +45,52 @@ def mojo_version() -> str:
     return out.stdout.strip()
 
 
-def build_shared_lib(src_path: str, out_path: str, opt: int = 3) -> None:
+# A build that does not finish has to end as a refusal, like any other build
+# failure, because the tiered design can only fall back to CPython if something
+# comes back. Some units make the compiler spin: one program out of the fuzzer
+# ran `mojo build` for two days on a single 35-line function before it was
+# noticed, holding a core the whole time. Minutes are already far outside the
+# 3-5s a real build takes.
+BUILD_TIMEOUT = 300.0
+
+
+def build_timeout() -> float:
+    return float(os.environ.get("MOJOSUB_BUILD_TIMEOUT", BUILD_TIMEOUT))
+
+
+def build_shared_lib(src_path: str, out_path: str, opt: int = 3,
+                     timeout: float | None = None) -> None:
     cmd = mojo_command() + [
         "build", "--emit", "shared-lib", f"--optimization-level={opt}",
         src_path, "-o", out_path,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+    limit = build_timeout() if timeout is None else timeout
+    # Its own session, so the timeout can kill the compiler's children too.
+    # `subprocess.run(timeout=...)` kills only the process it started and then
+    # waits on the pipes, which a surviving grandchild holds open - the timeout
+    # that was supposed to bound the build hangs on the build.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        raise ToolchainError(
+            f"mojo build did not finish within {limit:g}s "
+            f"(raise MOJOSUB_BUILD_TIMEOUT): {src_path}"
+        ) from None
     if proc.returncode != 0 or not os.path.exists(out_path):
-        raise ToolchainError((proc.stderr or proc.stdout).strip()[:4000])
+        raise ToolchainError((err or out).strip()[:4000])
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, AttributeError):
+        proc.kill()
+    try:
+        proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:  # pragma: no cover - the pipes are gone
+        pass
