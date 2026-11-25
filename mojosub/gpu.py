@@ -26,8 +26,9 @@ from __future__ import annotations
 
 import ast
 
-from .transpile import Signature, Unit, Unsupported, _Fn
-from .types import INT, NONE, Array
+from .transpile import (Signature, Unit, Unsupported, _Fn, _len_of, emit_body,
+                        _u)
+from .types import FLOAT, INT, NONE, Array, Matrix
 
 BLOCK = 256
 
@@ -77,6 +78,12 @@ def transpile_gpu(tree: ast.Module, sig: Signature, entry: str) -> Unit:
         raise Unsupported(f"no function named {entry}")
     if sig.ret is not NONE:
         raise Unsupported("a GPU function returns through its buffers, not a value")
+    if any(isinstance(t, Matrix) for _, t in sig.params):
+        # A matrix crosses the ABI as (address, rows, cols) and the wrapper
+        # below only knows how to marshal (address, length). Emitting it anyway
+        # builds a wrapper whose arity does not match the signature the runtime
+        # calls it with, which is undefined behaviour rather than an error.
+        raise Unsupported("a GPU function cannot take a 2-D buffer yet")
     if not any(isinstance(t, Array) for _, t in sig.params):
         raise Unsupported("a GPU function needs at least one buffer argument")
 
@@ -85,24 +92,33 @@ def transpile_gpu(tree: ast.Module, sig: Signature, entry: str) -> Unit:
 
     # The kernel takes the same parameters, plus the element count.
     kernel_sig = Signature(f"__kernel_{entry}", list(sig.params), NONE)
-    emitter = _Fn({}, kernel_sig, vectorize=False)
-    emitter.env[index] = INT
+
+    def make(pretyped):
+        em = _Fn({}, kernel_sig, vectorize=False, pretyped=pretyped)
+        em.env[index] = INT
+        em.loop_targets.add(index)
+        return em
+
+    emitter = emit_body(make, loop.body, 2)
     count_code, count_ty = emitter.expr(loop.iter.args[0])
     if count_ty is not INT:
         raise Unsupported("element count must be an integer")
-    emitter.block(loop.body, 2)
     body = "\n".join(emitter.lines)
 
+    # Identifiers go through the same two namespaces the CPU path uses: `u_`
+    # for the user's names, `n_` for the buffer lengths we synthesise. Without
+    # it a kernel with a variable called `var` or `fn` is a syntax error, and
+    # one with its own `xs_len` silently overwrites the length of `xs`.
     params = []
     for name, ty in sig.params:
-        params.append(f"{name}: {ty.mojo}")
+        params.append(f"{_u(name)}: {ty.mojo}")
         if isinstance(ty, Array):
-            params.append(f"{name}_len: Int")
+            params.append(f"{_len_of(name)}: Int")
 
     kernel = (
-        f"def __kernel_{entry}({', '.join(params)}):\n"
-        f"    var {index} = Int(thread_idx.x + block_idx.x * block_dim.x)\n"
-        f"    if {index} < {count_code}:\n"
+        f"def __kernel_{_u(entry)}({', '.join(params)}):\n"
+        f"    var {_u(index)} = Int(thread_idx.x + block_idx.x * block_dim.x)\n"
+        f"    if {_u(index)} < {count_code}:\n"
         f"{body}\n"
     )
 
@@ -110,24 +126,26 @@ def transpile_gpu(tree: ast.Module, sig: Signature, entry: str) -> Unit:
     wrap_params, allocs, copies_in, launch_args, copies_back = [], [], [], [], []
     for name, ty in sig.params:
         if isinstance(ty, Array):
-            wrap_params.append(f"{name}_addr: Int")
-            wrap_params.append(f"{name}_len: Int")
-            host = f"__h_{name}"
-            dev = f"__d_{name}"
+            wrap_params.append(f"{_u(name)}_addr: Int")
+            wrap_params.append(f"{_len_of(name)}: Int")
+            host = f"__h_{_u(name)}"
+            dev = f"__d_{_u(name)}"
             allocs.append(
-                f"        var {host} = {ty.mojo}(unsafe_from_address={name}_addr)"
+                f"        var {host} = {ty.mojo}"
+                f"(unsafe_from_address={_u(name)}_addr)"
             )
+            dtype = "DType.float64" if ty.elem is FLOAT else "DType.int64"
             allocs.append(
                 f"        var {dev} = ctx.enqueue_create_buffer"
-                f"[DType.float64]({name}_len)"
+                f"[{dtype}]({_len_of(name)})"
             )
             copies_in.append(f"        ctx.enqueue_copy({dev}, {host})")
             copies_back.append(f"        ctx.enqueue_copy({host}, {dev})")
             launch_args.append(f"{dev}.unsafe_ptr()")
-            launch_args.append(f"{name}_len")
+            launch_args.append(_len_of(name))
         else:
-            wrap_params.append(f"{name}: {ty.mojo}")
-            launch_args.append(name)
+            wrap_params.append(f"{_u(name)}: {ty.mojo}")
+            launch_args.append(_u(name))
 
     # the element count already refers to a `<buffer>_len` parameter, which
     # the wrapper takes verbatim
@@ -135,13 +153,13 @@ def transpile_gpu(tree: ast.Module, sig: Signature, entry: str) -> Unit:
 
     lines = [
         f'@export("mojosub_{entry}")',
-        f'def mojosub_wrap_{entry}({", ".join(wrap_params)}) abi("C") -> Int:',
+        f'def mojosub_wrap_{_u(entry)}({", ".join(wrap_params)}) abi("C") -> Int:',
         "    try:",
         "        var ctx = DeviceContext()",
     ]
     lines += allocs + copies_in
     lines.append(f"        var __n = {grid_source}")
-    lines.append(f"        ctx.enqueue_function[__kernel_{entry}](")
+    lines.append(f"        ctx.enqueue_function[__kernel_{_u(entry)}](")
     lines.append(f"            {', '.join(launch_args)},")
     lines.append(
         f"            grid_dim=(__n + {BLOCK - 1}) // {BLOCK}, block_dim={BLOCK},"

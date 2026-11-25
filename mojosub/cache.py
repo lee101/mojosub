@@ -1,8 +1,9 @@
 """Content-addressed compile cache.
 
-A unit's key is the hash of its Mojo source plus the compiler version and
-flags, so a cache hit is safe across processes and machines with the same
-toolchain. Builds are done to a temp file and renamed, which makes a
+A unit's key is the hash of its Mojo source, the compiler version and flags,
+and the instruction set of the machine doing the building (see `host_target`) —
+so a cache hit is safe across processes, and across machines that can actually
+run each other's code. Builds are done to a temp file and renamed, which makes a
 concurrent build racy but never corrupt.
 
 The cache also remembers **inferred signatures**. Knowing that a library exists
@@ -16,9 +17,11 @@ agent's generated pandas loop.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
+import platform
 import tempfile
 
 from .toolchain import build_shared_lib, mojo_version
@@ -28,10 +31,41 @@ DEFAULT_ROOT = os.path.expanduser(
 )
 
 
+@functools.lru_cache(maxsize=1)
+def host_target() -> str:
+    """An identifier for the instruction set this machine's builds will use.
+
+    `mojo build` documents `--target-cpu` as "Defaults to the host CPU", so an
+    artifact is only loadable on a machine whose instruction set is a superset
+    of the builder's. That is invisible on one box and fatal across a fleet: a
+    unit built on an AVX-512 worker, synced through the shared object store, and
+    `dlopen`ed on an AVX2 box does not fail to load — it runs, and dies on the
+    first vector instruction it was compiled to use.
+
+    So the CPU feature set goes in the cache key. Two machines that can run each
+    other's code share entries; two that cannot get their own. The flags are
+    what actually decides that, which is why they are hashed rather than the
+    model name — the same model number ships with features fused off.
+    """
+    parts = [platform.machine(), platform.system()]
+    try:
+        with open("/proc/cpuinfo", "r") as fh:
+            for line in fh:
+                if line.startswith("flags") or line.startswith("Features"):
+                    parts.append(" ".join(sorted(line.split(":", 1)[1].split())))
+                    break
+    except OSError:
+        # No /proc: fall back to the coarse identity. Over-sharing is not
+        # possible here, only under-sharing, because the machine string still
+        # separates architectures.
+        pass
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:12]
+
+
 def key_for(source: str, opt: int) -> str:
     h = hashlib.sha256()
     h.update(mojo_version().encode())
-    h.update(f"|O{opt}|v1|".encode())
+    h.update(f"|O{opt}|v2|{host_target()}|".encode())
     h.update(source.encode())
     return h.hexdigest()[:32]
 

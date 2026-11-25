@@ -20,7 +20,8 @@ from .transpile import (
     transpile,
 )
 from .gpu import transpile_gpu
-from .types import ARRAY_F64, ARRAY_I64, BOOL, FLOAT, INT, NONE, Array, Ty
+from .types import (ARRAY_F64, ARRAY_I64, BOOL, FLOAT, INT, MATRIX_F64,
+                    MATRIX_I64, NONE, Array, Matrix, Ty)
 from .types import by_mojo as types_by_mojo
 
 __all__ = [
@@ -71,10 +72,20 @@ def type_of(value) -> Ty:
         return FLOAT
     info = getattr(value, "__array_interface__", None)
     if info is not None:
-        if len(info["shape"]) != 1:
-            raise Unsupported("only 1-D arrays are supported")
-        return ARRAY_F64 if info["typestr"].endswith("f8") else ARRAY_I64
+        dims = len(info["shape"])
+        f64 = info["typestr"].endswith("f8")
+        if dims == 1:
+            return ARRAY_F64 if f64 else ARRAY_I64
+        if dims == 2:
+            return MATRIX_F64 if f64 else MATRIX_I64
+        raise Unsupported(f"only 1-D and 2-D arrays are supported, got {dims}-D")
     if isinstance(value, list) and value:
+        if any(isinstance(v, (list, tuple)) for v in value):
+            # A list of lists is not one allocation. It used to be typed as a
+            # flat int buffer, which failed later and confusingly at marshalling
+            # time; a 2-D argument has to expose a buffer.
+            raise Unsupported(
+                "a 2-D argument must be a numpy array, not a list of lists")
         return ARRAY_F64 if any(isinstance(v, float) for v in value) else ARRAY_I64
     if isinstance(value, list):
         return ARRAY_F64
@@ -88,8 +99,30 @@ def type_of(value) -> Ty:
 _SCALAR_TYPES = {bool: BOOL, int: INT, float: FLOAT}
 
 
-def _equalish(a, b, rtol: float = 1e-9) -> bool:
+# How far apart two tiers' floating-point answers may be before the compiled one
+# is retired as wrong.
+#
+# 1e-9 was too tight, and the way that showed up is instructive: a logistic
+# gradient over 20,000 rows disagreed in the 9th significant figure and was
+# retired, so a correct 261x kernel silently fell back to CPython for ever.
+#
+# The error bound says it had to. Summing n terms in a different order differs by
+# about `n * eps * sum(|x_i|)`, so the *relative* error is that over `|result|` —
+# and a gradient is a sum of signed terms that mostly cancel, which makes that
+# ratio large. For n = 5000 with three orders of cancellation the bound is around
+# 1e-8. The measured difference was 6.2e-9: inside theory, outside the tolerance.
+#
+# 1e-6 keeps the guard's power because a real miscompile is not a rounding
+# difference. Wrong index arithmetic reads different memory, a wrong operator
+# computes a different function, and a wrapped integer is off by 2^64 — all of
+# them O(1) relative, six orders clear of this line. The one thing loosened here
+# is precisely the thing that is allowed to vary.
+VERIFY_RTOL = float(os.environ.get("MOJOSUB_VERIFY_RTOL", "1e-6"))
+
+
+def _equalish(a, b, rtol: float | None = None) -> bool:
     """Compare two results, tolerating float reassociation but nothing else."""
+    rtol = VERIFY_RTOL if rtol is None else rtol
     if isinstance(a, float) and isinstance(b, float):
         if a != a and b != b:  # both NaN
             return True
@@ -132,10 +165,47 @@ def _restore(value, saved) -> None:
     value[:] = saved
 
 
+def _flat(buf):
+    """A flat element sequence, whatever the buffer's shape.
+
+    `list()` on a 2-D array yields *rows*, so comparing them element by element
+    hands `_equalish` two arrays and it returns an array — which `all()` then
+    refuses with "the truth value of an array is ambiguous". The verify path is
+    the one thing here that has to be trustworthy, so it flattens first.
+    """
+    ravel = getattr(buf, "ravel", None)
+    if ravel is not None:
+        return ravel()
+    return buf
+
+
+def _first_difference(a, b) -> str:
+    """Where two buffers stop agreeing, and by how much.
+
+    "these differ" is not a usable report when the variant is being retired for
+    ever on the strength of it; the index and the magnitude are what say whether
+    it is a reassociation rounding difference or a real miscompile.
+    """
+    fa, fb = list(_flat(a)), list(_flat(b))
+    if len(fa) != len(fb):
+        return f"length {len(fa)} vs {len(fb)}"
+    for i, (x, y) in enumerate(zip(fa, fb)):
+        if not _equalish(x, y):
+            try:
+                gap = abs(float(x) - float(y))
+                rel = gap / max(1.0, abs(float(x)), abs(float(y)))
+                return (f"element {i}: python={x!r} mojo={y!r} "
+                        f"(absolute {gap:.3g}, relative {rel:.3g})")
+            except (TypeError, ValueError):
+                return f"element {i}: python={x!r} mojo={y!r}"
+    return "no element differs (a shape or dtype mismatch)"
+
+
 def _buffers_equal(a, b) -> bool:
-    if len(a) != len(b):
+    fa, fb = _flat(a), _flat(b)
+    if len(fa) != len(fb):
         return False
-    return all(_equalish(x, y) for x, y in zip(list(a), list(b)))
+    return all(_equalish(x, y) for x, y in zip(list(fa), list(fb)))
 
 
 def _race_verdict(samples: list[tuple[float, float]]):
@@ -179,6 +249,14 @@ class Stats:
     raced_calls: int = 0
     speedup: float | None = None
     last_error: str | None = None
+    # Elements that had to be copied across the C ABI because they arrived as a
+    # Python sequence rather than a buffer, and the parameters they arrived on.
+    # This is the one cost in the whole pipeline that the *caller* can remove:
+    # measured on this machine, the same reduction is 2.2x on a million-element
+    # list and 147x on the same numbers in a numpy array. Nobody discovers that
+    # by reading their own code, so it is reported rather than left implicit.
+    copied_elements: int = 0
+    copied_params: tuple = ()
 
 
 def _module_of(fn, source: str | None = None) -> ast.Module:
@@ -198,16 +276,22 @@ def _module_of(fn, source: str | None = None) -> ast.Module:
     if src is None:
         src = inspect.getsource(fn)
     tree = ast.parse(textwrap.dedent(src))
-    body = [
-        node for node in tree.body
-        if not isinstance(node, ast.FunctionDef) or node.name == fn.__name__
-    ]
-    # A whole-module source carries every other definition too; keep the
-    # helpers (which `_helpers` reads for their signatures) and drop rival
-    # functions of the same name from an earlier cell.
-    tree.body = body if any(
-        isinstance(n, ast.FunctionDef) and n.name == fn.__name__ for n in body
-    ) else tree.body
+    # A whole-module source carries every other definition too. Keep them: the
+    # helpers are what `_helpers` reads signatures from, and a unit that omits
+    # them cannot emit `total += helper(x)` at all — it raises `Unsupported:
+    # call to helper` and the kernel silently never compiles, however carefully
+    # the caller annotated it.
+    #
+    # What does have to go is a *rival definition of the entry itself*, which
+    # is what a notebook cell re-run leaves behind. The last one is the one the
+    # caller is holding.
+    entry_defs = [n for n in tree.body
+                  if isinstance(n, ast.FunctionDef) and n.name == fn.__name__]
+    if len(entry_defs) > 1:
+        latest = entry_defs[-1]
+        tree.body = [n for n in tree.body
+                     if n is latest or not (isinstance(n, ast.FunctionDef)
+                                            and n.name == fn.__name__)]
     for node in tree.body:
         if isinstance(node, ast.FunctionDef):
             node.decorator_list = []
@@ -215,13 +299,39 @@ def _module_of(fn, source: str | None = None) -> ast.Module:
 
 
 def _helpers(tree: ast.Module, entry: str, globalns: dict) -> dict[str, Signature]:
-    """Signatures for annotated helper functions reachable from `entry`."""
+    """Signatures for annotated helper functions **reachable from** `entry`.
+
+    Reachability matters, and for a while this said so without doing it: every
+    annotated sibling went into the unit whether the entry point called it or
+    not. A unit is emitted whole or not at all, so one unrelated function using
+    `sorted` made every function in the file uncompilable — and the reported
+    reason was `call to sorted` for a kernel with no `sorted` in it, which is a
+    hard thing to debug from the outside.
+
+    Transitive, because a helper's own helpers are needed too.
+    """
+    defined = {node.name: node for node in tree.body
+               if isinstance(node, ast.FunctionDef)}
+    reachable: set[str] = set()
+    queue = [entry]
+    while queue:
+        name = queue.pop()
+        node = defined.get(name)
+        if node is None:
+            continue
+        for called in ast.walk(node):
+            if (isinstance(called, ast.Call) and isinstance(called.func, ast.Name)
+                    and called.func.id in defined
+                    and called.func.id not in reachable
+                    and called.func.id != entry):
+                reachable.add(called.func.id)
+                queue.append(called.func.id)
+
     sigs: dict[str, Signature] = {}
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name != entry:
-            sig = signature_from_annotations(node)
-            if sig is not None:
-                sigs[node.name] = sig
+    for name in reachable:
+        sig = signature_from_annotations(defined[name])
+        if sig is not None:
+            sigs[name] = sig
     return sigs
 
 
@@ -370,7 +480,7 @@ class JitFunction:
             )
             self.mojo_source = src
             try:
-                cache.remember_signature(self._source(), key, ret.mojo)
+                cache.remember_signature(self._source(), key, ret.key)
             except Exception:  # noqa: BLE001 - the memo is an optimisation
                 pass
             with self._lock:
@@ -462,9 +572,9 @@ class JitFunction:
             ty = _SCALAR_TYPES.get(a.__class__)
             if ty is None:
                 ty = type_of(a)
-                parts.append(ty.mojo + ("#buf" if _zero_copy(a) else "#seq"))
+                parts.append(ty.key + ("#buf" if _zero_copy(a) else "#seq"))
             else:
-                parts.append(ty.mojo)
+                parts.append(ty.key)
             argtypes.append(ty)
         return tuple(parts), argtypes
 
@@ -519,9 +629,21 @@ class JitFunction:
         if self.mode == "blocking":
             self._build(key, argtypes, ret)
         else:
-            threading.Thread(
-                target=self._build, args=(key, argtypes, ret), daemon=True
-            ).start()
+            try:
+                threading.Thread(
+                    target=self._build, args=(key, argtypes, ret), daemon=True
+                ).start()
+            except RuntimeError as exc:
+                # No thread to be had — a process limit, or a machine under
+                # real pressure. Compiling is an optimisation and the caller is
+                # already holding the right answer, so this must not be the
+                # thing that ends their program. It used to be: the exception
+                # unwound through `__call__` into user code, and a run that
+                # would have finished on CPython died with a traceback into
+                # this file.
+                with self._lock:
+                    self._pending.discard(key)
+                    self.stats.last_error = f"could not start a compile: {exc}"
         return result
 
     def _trial_call(self, key, call, args):
@@ -575,22 +697,30 @@ class JitFunction:
         self.stats.python_calls += 1
         self.stats.raced_calls += 1
 
-        agreed = not self.verify or (
-            _equalish(expected, actual)
-            and all(_buffers_equal(p, b) for p, b in zip(after_python, buffers))
-        )
+        disagreement = None
+        if self.verify:
+            # Which of the two disagreed has to be in the message. Reporting the
+            # return value when a *buffer* was what differed sends the reader to
+            # look at numbers that match, and the retirement is permanent.
+            if not _equalish(expected, actual):
+                disagreement = f"return value: python={expected!r} mojo={actual!r}"
+            else:
+                for idx, (was, now) in enumerate(zip(after_python, buffers)):
+                    if not _buffers_equal(was, now):
+                        disagreement = (
+                            f"buffer argument {idx}: "
+                            f"{_first_difference(was, now)}"
+                        )
+                        break
+        agreed = disagreement is None
         if not agreed:
             with self._lock:
                 self._trials.pop(key, None)
                 self._variants.pop(key, None)
                 self._failed.add(key)
                 self.stats.verify_failures += 1
-                self.stats.last_error = (
-                    f"verification failed: python={expected!r} mojo={actual!r}"
-                )
-            self._record(
-                key, retired=f"disagreed with CPython: {expected!r} != {actual!r}"
-            )
+                self.stats.last_error = f"verification failed: {disagreement}"
+            self._record(key, retired=f"disagreed with CPython — {disagreement}")
             # The buffers hold the native writes; the answer the caller gets is
             # the interpreted one, in every respect.
             for buf, saved in zip(buffers, after_python):
@@ -658,6 +788,24 @@ class JitFunction:
     @property
     def compiled(self) -> bool:
         return bool(self._variants)
+
+    def copy_cost(self) -> tuple[int, tuple]:
+        """Elements copied across the ABI so far, and the parameters they were.
+
+        Summed from the variants rather than counted on the dispatch path: the
+        bound `Callable` is the only thing that sees the arguments, and a
+        scalar-only signature bypasses it entirely (and copies nothing).
+        """
+        total = 0
+        params: set[str] = set()
+        for call in self._variants.values():
+            n = getattr(call, "copied_elements", 0)
+            if n:
+                total += n
+                params |= getattr(call, "copied_params", set())
+        self.stats.copied_elements = total
+        self.stats.copied_params = tuple(sorted(params))
+        return total, self.stats.copied_params
 
 
 def functools_wraps(wrapper, fn) -> None:

@@ -1,10 +1,13 @@
+import ast
 import math
+import textwrap
 import time
 
 import pytest
 
 from mojosub import Unsupported, execute, jit
 from mojosub.api import RACE_CALLS as RACE_SETTLE_CALLS, compile_function
+from mojosub.transpile import signature_from_annotations, transpile
 from mojosub.types import ARRAY_F64, FLOAT, INT
 
 
@@ -289,7 +292,10 @@ def test_gpu_target_matches_the_cpu_result():
         gpu, src = compile_function(logistic, argtypes, NONE, target="gpu")
     except Exception as exc:  # MAX not installed in this environment
         pytest.skip(f"no GPU toolchain: {exc}")
-    assert "__kernel_logistic" in src and "thread_idx" in src
+    # The exported symbol keeps the Python name — the runtime looks it up by
+    # that — while the kernel and every identifier inside it are namespaced.
+    assert '@export("mojosub_logistic")' in src
+    assert "__kernel_u_logistic" in src and "thread_idx" in src
 
     cpu, _ = compile_function(logistic, argtypes, NONE)
     a = np.ascontiguousarray(np.linspace(0.01, 0.99, 4096))
@@ -579,3 +585,811 @@ def test_a_list_and_an_array_do_not_share_a_verdict():
     all_keys = set(accelerated._variants) | set(accelerated._failed)
 
     assert len(all_keys) == len(array_keys) + 1
+
+
+# --- identifier namespacing -------------------------------------------------
+#
+# Three bugs, all found by running a corpus of ordinary statistics code through
+# the pipeline and looking at what the host compiler said. Each one is cheap to
+# reintroduce and expensive to have: two are five wasted seconds of compiler per
+# submission, and the third is a wrong answer.
+
+
+def test_mojo_keywords_are_legal_python_names():
+    """`var = sq/n - mean*mean` is what computing a variance looks like.
+
+    It used to emit `var var: Float64 = ...` — a syntax error — so the kernel
+    burned a compile on every submission and never once went native.
+    """
+    def variance(xs: list[float]) -> float:
+        total = 0.0
+        for i in range(len(xs)):
+            total += xs[i]
+        mean = total / float(len(xs))
+        var = 0.0
+        fn = 0.0
+        for i in range(len(xs)):
+            fn = xs[i] - mean
+            var += fn * fn
+        return var / float(len(xs))
+
+    call, src = compile_function(variance, [ARRAY_F64], FLOAT)
+    assert "var var" not in src and "var fn" not in src
+    xs = [float(i % 17) for i in range(500)]
+    mean = sum(xs) / len(xs)
+    assert call(xs) == pytest.approx(sum((x - mean) ** 2 for x in xs) / len(xs))
+
+
+def test_a_users_own_len_name_does_not_shadow_a_buffer_length():
+    """`xs_len` is the name we synthesise for `len(xs)`.
+
+    A program with its own variable of that name used to reassign it, so every
+    later `len(xs)` returned whatever the user had stored — a wrong answer, in
+    silence, which the verify pass can only catch after the fact.
+    """
+    def count_above(xs: list[float], cut: float) -> float:
+        xs_len = 3.0
+        hits = 0.0
+        for i in range(len(xs)):
+            if xs[i] > cut:
+                hits += 1.0
+        return hits + xs_len * 0.0
+
+    call, src = compile_function(count_above, [ARRAY_F64, FLOAT], FLOAT)
+    xs = [float(i) for i in range(100)]
+    # 100 elements, not the 3 the user's variable would have claimed.
+    assert call(xs, -1.0) == pytest.approx(100.0)
+    assert "n_xs" in src and "u_xs_len" in src
+
+
+def test_a_type_name_can_be_used_as_a_variable():
+    def shadowy(n: int) -> int:
+        Int = 0
+        for i in range(n):
+            Int += i
+        return Int
+
+    call, _src = compile_function(shadowy, [INT], INT)
+    assert call(10) == 45
+
+
+def test_namespacing_survives_helper_calls_and_buffer_lengths():
+    """A helper has to receive the *caller's* length for the buffer it is given.
+
+    The length is derived from the argument's name, so passing one across a call
+    means naming it in the callee's namespace — the one place the two mappings
+    have to agree. `compile_source` rather than a nested def: helpers are only
+    reachable when they share a source unit with the entry point.
+    """
+    from mojosub.api import compile_source
+
+    src = """
+def inner(xs: list[float], var: float) -> float:
+    out = 0.0
+    for i in range(len(xs)):
+        out += xs[i] * var
+    return out
+
+def outer(xs: list[float]) -> float:
+    return inner(xs, 2.0) + float(len(xs))
+"""
+    xs = [1.0, 2.0, 3.0]
+    call = compile_source(src, "outer", (xs,))
+    assert call(xs) == pytest.approx(12.0 + 3.0)
+
+
+def test_reassigning_a_buffer_parameter_is_refused_not_miscompiled():
+    def rebind(xs: list[float]) -> float:
+        xs = 1.0
+        return xs
+
+    with pytest.raises(Unsupported):
+        compile_function(rebind, [ARRAY_F64], FLOAT)
+
+
+# --- what the compiled code may write through -------------------------------
+
+
+def test_a_read_only_list_argument_is_not_copied_back():
+    """The copy back is 45-63% of the call for a reduction over a list.
+
+    It is also pointless there: a reduction cannot have stored anything. The
+    transpiler records which parameters it emitted stores for, and the runtime
+    skips the write-back for the rest.
+    """
+    def dot(a: list[float], b: list[float]) -> float:
+        total = 0.0
+        for i in range(len(a)):
+            total += a[i] * b[i]
+        return total
+
+    call, _src = compile_function(dot, [ARRAY_F64, ARRAY_F64], FLOAT)
+    assert call.sig.writes == frozenset()
+    assert not call.sig.may_write("a")
+    xs, ys = [1.0, 2.0, 3.0], [4.0, 5.0, 6.0]
+    assert call(xs, ys) == pytest.approx(32.0)
+    # and the inputs are untouched, which is the only thing skipping it risks
+    assert xs == [1.0, 2.0, 3.0] and ys == [4.0, 5.0, 6.0]
+
+
+def test_a_written_list_argument_is_still_copied_back():
+    def scale(xs: list[float], k: float) -> float:
+        total = 0.0
+        for i in range(len(xs)):
+            xs[i] = xs[i] * k
+            total += xs[i]
+        return total
+
+    call, _src = compile_function(scale, [ARRAY_F64, FLOAT], FLOAT)
+    assert call.sig.writes == frozenset({"xs"})
+    data = [1.0, 2.0, 3.0]
+    assert call(data, 2.0) == pytest.approx(12.0)
+    assert data == [2.0, 4.0, 6.0]
+
+
+def test_a_buffer_passed_to_a_helper_is_assumed_written():
+    """Following a buffer into a callee is a real escape analysis; getting it
+    wrong hands the caller a silently stale array. So a buffer handed to a
+    helper keeps its copy back, whatever the helper does with it."""
+    from mojosub.api import compile_source
+
+    src = """
+def fill(xs: list[float], k: float) -> float:
+    for i in range(len(xs)):
+        xs[i] = k
+    return k
+
+def outer(xs: list[float]) -> float:
+    return fill(xs, 7.0)
+"""
+    data = [1.0, 2.0, 3.0]
+    call = compile_source(src, "outer", (data,))
+    assert call(data) == pytest.approx(7.0)
+    assert data == [7.0, 7.0, 7.0]
+
+
+def test_an_unanalysed_signature_still_copies_back():
+    """`writes=None` means nobody looked, which has to read as "may write" —
+    a hand-built Signature must not silently lose a write-back."""
+    from mojosub.transpile import Signature
+
+    sig = Signature("f", [("xs", ARRAY_F64)], FLOAT)
+    assert sig.writes is None
+    assert sig.may_write("xs")
+
+
+def test_cache_key_separates_machines_that_cannot_run_each_others_code():
+    """`mojo build` targets the host CPU, and the cache is shared across a
+    fleet through an object store. A unit built where AVX-512 exists and loaded
+    where it does not runs until the first vector instruction and then dies, so
+    the instruction set has to be part of the key."""
+    from mojosub import cache
+
+    unit = "def f(n: Int) -> Int:\n    return n\n"
+    here = cache.key_for(unit, 3)
+
+    real = cache.host_target
+    try:
+        cache.host_target = lambda: "0" * 12
+        elsewhere = cache.key_for(unit, 3)
+    finally:
+        cache.host_target = real
+    assert here != elsewhere, "same key on machines with different instruction sets"
+    # and the same machine still shares with itself
+    assert cache.key_for(unit, 3) == here
+
+
+# --- module-level constants ---------------------------------------------
+#
+# `WINDOW = 64` at the top of a file and `range(WINDOW)` in the kernel is
+# ordinary Python and was the most common reason a numeric function would not
+# compile. The literal is folded into the emitted Mojo, so the unit's content
+# hash moves when the constant does.
+
+def _module(src):
+    return ast.parse(textwrap.dedent(src))
+
+
+def test_a_module_constant_is_folded_in():
+    tree = _module("""
+        WINDOW = 64
+
+        def k(n: int) -> int:
+            t = 0
+            for i in range(n):
+                t += WINDOW
+            return t
+    """)
+    unit = transpile(tree, {"k": signature_from_annotations(tree.body[1])}, "k")
+    assert "64" in unit.source
+    assert "u_WINDOW" not in unit.source
+
+
+def test_a_float_and_a_negative_constant_are_folded():
+    tree = _module("""
+        RATE = 0.25
+        OFFSET = -3
+
+        def k(n: int) -> float:
+            t = 0.0
+            for i in range(n):
+                t += RATE * float(OFFSET)
+            return t
+    """)
+    unit = transpile(tree, {"k": signature_from_annotations(tree.body[2])}, "k")
+    assert "0.25" in unit.source and "-3" in unit.source
+
+
+def test_a_name_the_module_rebinds_is_not_a_constant():
+    """A constant that is really a variable would be frozen at whatever value
+    it happened to have when we read the source."""
+    tree = _module("""
+        LIMIT = 10
+        LIMIT = 20
+
+        def k(n: int) -> int:
+            t = 0
+            for i in range(n):
+                t += LIMIT
+            return t
+    """)
+    with pytest.raises(Unsupported):
+        transpile(tree, {"k": signature_from_annotations(tree.body[2])}, "k")
+
+
+def test_a_name_a_function_assigns_is_not_a_constant():
+    tree = _module("""
+        COUNT = 5
+
+        def bump():
+            global COUNT
+            COUNT = 6
+
+        def k(n: int) -> int:
+            return COUNT * n
+    """)
+    fn = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "k"][0]
+    with pytest.raises(Unsupported):
+        transpile(tree, {"k": signature_from_annotations(fn)}, "k")
+
+
+def test_a_computed_module_value_is_not_a_constant():
+    """Only literals. Anything else is an expression we would have to run."""
+    tree = _module("""
+        SIZE = len([1, 2, 3])
+
+        def k(n: int) -> int:
+            return SIZE + n
+    """)
+    fn = tree.body[1]
+    with pytest.raises(Unsupported):
+        transpile(tree, {"k": signature_from_annotations(fn)}, "k")
+
+
+def test_a_parameter_beats_a_constant_of_the_same_name():
+    tree = _module("""
+        SCALE = 2
+
+        def k(SCALE: int) -> int:
+            return SCALE + 1
+    """)
+    unit = transpile(tree, {"k": signature_from_annotations(tree.body[1])}, "k")
+    assert "u_SCALE + 1" in unit.source.replace("(", "").replace(")", "")
+
+
+def test_changing_a_constant_changes_the_emitted_source():
+    """Which is what keeps the content-addressed cache honest."""
+    def unit_for(value):
+        tree = _module(f"""
+            W = {value}
+
+            def k(n: int) -> int:
+                return W * n
+        """)
+        return transpile(tree, {"k": signature_from_annotations(tree.body[1])},
+                         "k").source
+
+    assert unit_for(3) != unit_for(4)
+
+
+def test_a_compile_that_cannot_be_started_does_not_end_the_program(monkeypatch):
+    """Compiling is an optimisation. A machine that cannot spare a thread must
+    cost the caller their speedup, never their run."""
+    import threading as _threading
+
+    from mojosub import api as _api
+
+    class Refusing:
+        def __init__(self, *a, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(_api.threading, "Thread", Refusing)
+
+    @jit(hot_calls=1, warm=False)
+    def k(n: int) -> int:
+        t = 0
+        for i in range(n):
+            t += i
+        return t
+
+    assert k(10) == 45
+    assert k(10) == 45
+    assert "could not start a compile" in (k.stats.last_error or "")
+    assert _threading  # the real module is untouched outside the patch
+
+
+def test_a_kernel_that_calls_a_helper_actually_compiles():
+    """`_module_of` used to keep only the entry function, so a kernel calling
+    an annotated helper raised `Unsupported: call to helper` every time — the
+    filter offered it, the transpiler refused it, and the compile budget went
+    on nothing. Helpers are ordinary code; this is the common case, not a
+    corner."""
+    source = textwrap.dedent("""
+        def helper(x: float) -> float:
+            return x * x + 1.0
+
+        def outer(n: int) -> float:
+            t = 0.0
+            for i in range(n):
+                t += helper(i * 0.5)
+            return t
+    """)
+    ns: dict = {"__mojosub_source__": source}
+    exec(source, ns)  # noqa: S102 - the point is a function with no file
+    call, mojo = compile_function(ns["outer"])
+    assert "u_helper" in mojo
+    assert call(10) == ns["outer"](10)
+
+
+# --- 2-D buffers ------------------------------------------------------------
+#
+# The shape almost all interesting machine-learning work has is a feature
+# matrix. Without this it could not be expressed at all: a kernel over one had
+# to be rewritten against a flat array with the stride arithmetic by hand, which
+# is a different program from the one the caller debugged in numpy.
+
+
+def test_a_matrix_is_indexed_row_major():
+    np = pytest.importorskip("numpy")
+    from mojosub.api import compile_source
+
+    src = """
+def rowsums(m, out) -> float:
+    total = 0.0
+    for i in range(m.shape[0]):
+        s = 0.0
+        for j in range(m.shape[1]):
+            s += m[i, j]
+        out[i] = s
+        total += s
+    return total
+"""
+    m = np.arange(12, dtype=np.float64).reshape(3, 4)
+    out = np.zeros(3)
+    call = compile_source(src, "rowsums", (m, out))
+    out[:] = 0.0
+    assert call(m, out) == pytest.approx(66.0)
+    assert list(out) == [6.0, 22.0, 38.0]
+
+
+def test_a_matrix_and_a_flat_array_do_not_share_a_variant():
+    """Both compile to a bare pointer, so the emitted Mojo text is identical.
+    Keying a variant on that text would let a 2-D call reuse the 1-D library —
+    which reads the wrong addresses and returns a plausible wrong number."""
+    from mojosub.types import ARRAY_F64, MATRIX_F64
+
+    assert ARRAY_F64.mojo == MATRIX_F64.mojo
+    assert ARRAY_F64.key != MATRIX_F64.key
+    # Array keeps its old spelling so signature memos already on disk resolve.
+    assert ARRAY_F64.key == ARRAY_F64.mojo
+
+    from mojosub.types import by_mojo
+
+    assert by_mojo(MATRIX_F64.key) is MATRIX_F64
+    assert by_mojo(ARRAY_F64.key) is ARRAY_F64
+
+
+def test_len_of_a_matrix_is_its_row_count():
+    np = pytest.importorskip("numpy")
+    from mojosub.api import compile_source
+
+    src = """
+def rows(m) -> int:
+    n = 0
+    for i in range(len(m)):
+        n += 1
+    return n
+"""
+    m = np.zeros((7, 3))
+    assert compile_source(src, "rows", (m,))(m) == 7
+
+
+def test_a_non_contiguous_matrix_is_refused_not_misread():
+    """The emitted index arithmetic is `row * cols + col`. That is the wrong
+    address for a transposed or sliced array, and reading the wrong memory
+    returns a plausible number rather than an error — so it is refused."""
+    np = pytest.importorskip("numpy")
+    from mojosub.api import compile_source
+
+    src = """
+def total(m) -> float:
+    t = 0.0
+    for i in range(m.shape[0]):
+        for j in range(m.shape[1]):
+            t += m[i, j]
+    return t
+"""
+    m = np.arange(12, dtype=np.float64).reshape(3, 4)
+    call = compile_source(src, "total", (m,))
+    assert call(m) == pytest.approx(66.0)
+    with pytest.raises(TypeError, match="contiguous"):
+        call(m[:, ::2])
+    # and the fix the message names actually works
+    assert call(np.ascontiguousarray(m[:, ::2])) == pytest.approx(
+        float(m[:, ::2].sum()))
+
+
+def test_a_list_of_lists_is_refused_with_a_useful_message():
+    """It used to be typed as a flat int buffer and fail later at marshalling."""
+    from mojosub.api import type_of
+
+    with pytest.raises(Unsupported, match="numpy array"):
+        type_of([[1.0, 2.0], [3.0, 4.0]])
+
+
+def test_a_matrix_index_on_a_flat_buffer_is_refused():
+    from mojosub.api import compile_function
+    from mojosub.types import ARRAY_F64
+
+    def bad(xs: list[float]) -> float:
+        t = 0.0
+        for i in range(len(xs)):
+            t += xs[i, 0]
+        return t
+
+    with pytest.raises(Unsupported):
+        compile_function(bad, [ARRAY_F64], FLOAT)
+
+
+def test_a_matrix_crosses_into_a_helper_with_both_shape_arguments():
+    np = pytest.importorskip("numpy")
+    from mojosub.api import compile_source
+
+    # The helper needs full annotations to be in the unit at all, and
+    # `list[list[float]]` is how a 2-D buffer is spelled — the same way
+    # `list[float]` means a flat one.
+    src = """
+def row_total(m: list[list[float]], i: int) -> float:
+    t = 0.0
+    for j in range(m.shape[1]):
+        t += m[i, j]
+    return t
+
+def grand(m) -> float:
+    t = 0.0
+    for i in range(m.shape[0]):
+        t += row_total(m, i)
+    return t
+"""
+    m = np.arange(12, dtype=np.float64).reshape(3, 4)
+    assert compile_source(src, "grand", (m,))(m) == pytest.approx(66.0)
+
+
+def test_shape_is_the_only_attribute_allowed():
+    from mojosub.api import compile_function
+    from mojosub.types import MATRIX_F64
+
+    def bad(m) -> float:
+        t = 0.0
+        for i in range(m.size):
+            t += 1.0
+        return t
+
+    with pytest.raises(Unsupported):
+        compile_function(bad, [MATRIX_F64], FLOAT)
+
+
+def test_verify_compares_a_2d_buffer_elementwise():
+    """A 2-D buffer written by the kernel has to be comparable against CPython's.
+
+    `list()` on a 2-D array yields rows, so the naive elementwise comparison
+    hands two arrays to a scalar comparison and raises "the truth value of an
+    array is ambiguous" — turning the verify pass, which exists to make the fast
+    path trustworthy, into the thing that breaks the run.
+    """
+    np = pytest.importorskip("numpy")
+
+    @jit(mode="blocking", verify=True, warm=False)
+    def scale_rows(m, k: float) -> float:
+        total = 0.0
+        for i in range(m.shape[0]):
+            for j in range(m.shape[1]):
+                m[i, j] = m[i, j] * k
+                total += m[i, j]
+        return total
+
+    want = float(np.arange(12, dtype=np.float64).sum() * 3.0)
+    a = np.arange(12, dtype=np.float64).reshape(3, 4)
+    assert scale_rows(a, 3.0) == pytest.approx(want)
+    b = np.arange(12, dtype=np.float64).reshape(3, 4)
+    assert scale_rows(b, 3.0) == pytest.approx(want)   # the verified call
+    assert scale_rows.stats.verify_failures == 0
+    assert np.allclose(b, np.arange(12).reshape(3, 4) * 3.0)
+
+
+def test_reassociation_is_tolerated_but_a_wrong_answer_is_not():
+    """The verify tolerance has to sit between two things that are far apart.
+
+    Summing n terms in a different order — which is what vectorising a reduction
+    does — differs by about `n * eps * sum(|x_i|)`, and for a sum with heavy
+    cancellation that relative error reaches 1e-8. A real miscompile is nothing
+    like that small: wrong indexing reads different memory, a wrong operator
+    computes a different function, a wrapped integer is off by 2^64. If the line
+    is drawn too tight, correct kernels are retired for ever and fall back
+    silently, which is what 1e-9 did to a 261x logistic gradient.
+    """
+    from mojosub.api import VERIFY_RTOL, _equalish
+
+    # reassociation-scale disagreement: kept
+    assert _equalish(1.7556090564380296, 1.755609045572715)
+    assert 1e-9 < VERIFY_RTOL < 1e-3, VERIFY_RTOL
+
+    # miscompile-scale disagreement: rejected
+    assert not _equalish(1.0, 1.001)
+    assert not _equalish(1.0, -1.0)
+    assert not _equalish(0.0, 1e-3)
+    # and integers are still compared exactly, which is what catches Int wrap
+    assert not _equalish(2 ** 63, -(2 ** 63))
+
+
+def test_an_unrelated_function_in_the_file_does_not_block_compilation():
+    """A unit is emitted whole or not at all, so only what the entry point can
+    actually reach may go into it.
+
+    Every annotated sibling used to be included regardless. One function using
+    `sorted` therefore made every function in the module uncompilable, and the
+    reason reported for a clean kernel was `call to sorted` — pointing at code
+    that is not in it.
+    """
+    from mojosub.api import compile_source
+
+    src = """
+def needs_sorting(xs: list[float]) -> float:
+    return sorted(xs)[0]
+
+def ewma(xs: list[float], alpha: float) -> float:
+    acc = xs[0]
+    for i in range(1, len(xs)):
+        acc = alpha * xs[i] + (1.0 - alpha) * acc
+    return acc
+"""
+    xs = [1.0, 2.0, 3.0, 4.0]
+    call = compile_source(src, "ewma", (xs, 0.5))
+    expected = xs[0]
+    for x in xs[1:]:
+        expected = 0.5 * x + 0.5 * expected
+    assert call(xs, 0.5) == pytest.approx(expected)
+
+
+def test_a_helper_the_entry_point_calls_is_still_included():
+    from mojosub.api import compile_source
+
+    src = """
+def unrelated(xs: list[float]) -> float:
+    return sorted(xs)[0]
+
+def twice(x: float) -> float:
+    return x * 2.0
+
+def total(xs: list[float]) -> float:
+    t = 0.0
+    for i in range(len(xs)):
+        t += twice(xs[i])
+    return t
+"""
+    xs = [1.0, 2.0, 3.0]
+    assert compile_source(src, "total", (xs,))(xs) == pytest.approx(12.0)
+
+
+# --- Python scoping vs Mojo scoping -----------------------------------------
+#
+# Three bugs, all found by the first dozen programs out of bench/fuzz.py, all the
+# same root cause: Python scopes a local to its function and Mojo scopes a `var`
+# to its block. Every one of them made ordinary Python fail to compile — and in
+# the service a failed compile is invisible, because the tiered design falls back
+# to CPython and returns the right answer slowly.
+
+
+def test_a_function_may_reassign_its_own_parameter():
+    """`n = n * 2` is ordinary Python. A Mojo parameter is an immutable binding,
+    so emitting it verbatim is `invalid redefinition` and the kernel never
+    compiled — the first thing the fuzzer generated."""
+    @jit(mode="blocking", warm=False)
+    def doubled(n: int, x: float) -> float:
+        n = n * 2
+        x = x + 1.0
+        total = 0.0
+        for _ in range(n):
+            total += x
+        return total
+
+    assert doubled(3, 1.0) == pytest.approx(12.0)
+    assert doubled(3, 1.0) == pytest.approx(12.0)
+    assert doubled.compiled
+    assert doubled.stats.last_error is None, doubled.stats.last_error
+
+
+def test_a_local_first_assigned_inside_a_block_survives_it():
+    """Python scopes to the function; a Mojo `var` scopes to its block."""
+    @jit(mode="blocking", warm=False)
+    def conditional(n: int) -> float:
+        total = 0.0
+        for i in range(n):
+            if i % 2 == 0:
+                hit = 1.5
+                total += hit
+        return total + hit
+
+    assert conditional(4) == pytest.approx(3.0 + 1.5)
+    assert conditional(4) == pytest.approx(3.0 + 1.5)
+    assert conditional.compiled
+
+
+def test_a_loop_counter_can_be_read_after_its_loop():
+    """Python leaves a `for` target bound at its last value; Mojo does not."""
+    @jit(mode="blocking", warm=False)
+    def last_index(n: int) -> float:
+        for i in range(n):
+            pass
+        return float(i)
+
+    assert last_index(5) == pytest.approx(4.0)
+    assert last_index(5) == pytest.approx(4.0)
+    assert last_index.compiled
+
+
+def test_a_loop_counter_can_be_reassigned_inside_its_loop():
+    """A Mojo loop variable is immutable; Python's is not."""
+    @jit(mode="blocking", warm=False)
+    def skipping(n: int) -> int:
+        seen = 0
+        for i in range(n):
+            seen += 1
+            i = i + 1
+        return seen
+
+    assert skipping(4) == 4
+    assert skipping(4) == 4
+    assert skipping.compiled
+
+
+# --- a local holds one type in Mojo and many in Python -----------------------
+#
+# `t = 0` followed by `t += xs[i]` is the commonest shape in this whole subset,
+# and declaring `t` from its first assignment made every later store `Int(...)`.
+# That is a wrong answer rather than a slow one, and nothing was watching for it:
+# the emitted Mojo compiled, ran, and returned a truncated number.
+
+
+def test_a_local_widens_to_the_type_python_would_give_it():
+    def widen(x: float) -> float:
+        t = 0                 # an int here, a float after the loop
+        for _ in range(3):
+            t += x
+        flag = True           # a bool, then an int
+        flag = 5
+        return float(t) + float(flag) + float(2 ** -1)
+
+    call, src = compile_function(widen, [FLOAT], FLOAT)
+    assert "var u_t: Float64" in src
+    assert "var u_flag: Int" in src
+    assert call(1.25) == pytest.approx(widen(1.25))
+    assert call(1.25) == pytest.approx(3.75 + 5.0 + 0.5)
+
+
+def test_an_integer_power_with_a_runtime_exponent_is_refused():
+    """`2 ** n` is 0.5 in CPython and 0 in Mojo when n is -1, and which one it
+    is cannot be known until the call. A refusal costs the speedup; guessing
+    costs the answer."""
+    def p(a: int, b: int) -> float:
+        return float(a ** b)
+
+    with pytest.raises(Unsupported):
+        compile_function(p, [INT, INT], FLOAT)
+
+
+def test_a_parameter_reassigned_to_a_wider_type_is_refused():
+    """A parameter's type is fixed by the ABI, so it cannot be widened the way
+    a local can."""
+    def halve(n: int) -> float:
+        n = n / 2
+        return float(n)
+
+    with pytest.raises(Unsupported):
+        compile_function(halve, [INT], FLOAT)
+
+
+def test_a_loop_counter_reassigned_to_a_float_is_refused():
+    def bad(n: int) -> float:
+        for i in range(n):
+            i = 1.5
+        return float(i)
+
+    with pytest.raises(Unsupported):
+        compile_function(bad, [INT], FLOAT)
+
+
+def test_math_constants_and_n_ary_min_max():
+    """`math.pi` was `Unsupported: expression Attribute`, and Mojo's min/max are
+    binary where Python's take any number of arguments. Both cost the whole
+    kernel for a line of ordinary arithmetic."""
+    def k(x: float) -> float:
+        return min(x, math.pi, math.e) + max(x, 1.0, 2.0, 3.0)
+
+    call, src = compile_function(k, [FLOAT], FLOAT)
+    assert "3.14159" in src
+    assert call(2.0) == pytest.approx(k(2.0))
+
+
+def test_a_buffer_cannot_be_bound_to_a_local():
+    """Its length is derived from the parameter's name and would not follow it.
+    Emitting it anyway declares a pointer initialised to 0 and burns a compile
+    to discover that."""
+    def alias(xs: list[float]) -> float:
+        ys = xs
+        return ys[0]
+
+    with pytest.raises(Unsupported):
+        compile_function(alias, [ARRAY_F64], FLOAT)
+
+
+def test_a_build_that_never_finishes_is_a_refusal_not_a_hang():
+    """Some units make the compiler spin - one program out of bench/fuzz.py ran
+    `mojo build` for two days on 35 lines. The tiered design can only fall back
+    to CPython if something comes back, so the build is bounded."""
+    import os
+    import tempfile
+
+    from mojosub.toolchain import ToolchainError, build_shared_lib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "unit.mojo")
+        with open(src, "w") as fh:
+            fh.write("def f(n: Int) -> Int:\n    return n\n")
+        with pytest.raises(ToolchainError, match="did not finish"):
+            build_shared_lib(src, os.path.join(tmp, "unit.so"), timeout=0.05)
+
+
+def test_the_gpu_target_refuses_a_2d_buffer():
+    """A matrix crosses the ABI as (address, rows, cols); the GPU wrapper only
+    marshals (address, length), so emitting one builds a symbol whose arity
+    does not match the call - undefined behaviour, not an error."""
+    from mojosub.types import MATRIX_F64, NONE
+
+    def rows(m, out: list[float]):
+        for i in range(len(out)):
+            out[i] = m[i, 0]
+
+    with pytest.raises(Unsupported, match="2-D"):
+        compile_function(rows, [MATRIX_F64, ARRAY_F64], NONE, target="gpu")
+
+
+def test_a_loop_inside_a_branch_still_hoists_its_counter():
+    """The hoisted declaration has to reach function scope. Emitted at the loop's
+    own depth it is still inside the `else:` and just as unreachable."""
+    @jit(mode="blocking", warm=False)
+    def branchy(n: int, flag: bool) -> int:
+        if flag:
+            total = 1
+        else:
+            for i in range(n):
+                total = 2
+        i = 7
+        return total + i
+
+    assert branchy(3, False) == 9
+    assert branchy(3, False) == 9
+    assert branchy.compiled
